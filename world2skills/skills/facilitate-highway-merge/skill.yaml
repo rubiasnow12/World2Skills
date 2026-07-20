@@ -1,0 +1,108 @@
+schema_version: "0.1"
+name: facilitate-highway-merge
+version: "1.0"
+domain: autonomous-driving
+category: interaction
+tags: [merge, cooperative, on-ramp]
+
+description: >
+  On the main highway, keep speed while making room for a vehicle merging in
+  from the access ramp, avoiding collision.
+
+entities:
+  - { name: ego, role: controlled-vehicle }
+  - { name: merging_vehicle, role: traffic }
+  - { name: highway, role: static-topology }
+
+parameters:
+  target_speed:
+    type: float
+    unit: m/s
+    range: [0, 30]
+    default: 25
+    description: desired cruising speed on the main highway
+  conflict_gap:
+    type: float
+    unit: s
+    range: [1, 4]
+    default: 2
+    description: time-to-conflict threshold below which the ego makes room
+
+interface:
+  observations:
+    - { name: merging_vehicle_state, type: kinematic, features: [presence, x, y, vx, vy, heading] }
+    - { name: ego_state, type: kinematic }
+  actions:
+    - { name: lateral, type: discrete-meta, primitives: [change-lane-left] }
+    - { name: longitudinal, type: discrete-meta, primitives: [maintain-speed, accelerate, decelerate] }
+
+preconditions:
+  - "ego on main highway"
+  - "a vehicle is merging from the access ramp"
+
+execution:
+  entry: watch-ramp
+  steps:
+    - id: watch-ramp
+      kind: observe
+      transitions:
+        - { condition: "always", next: assess-conflict }
+    - id: assess-conflict
+      kind: branch
+      transitions:
+        - { condition: "time_to_conflict < conflict_gap and left_lane_clear", next: move-left }
+        - { condition: "time_to_conflict < conflict_gap and not left_lane_clear", next: open-gap }
+        - { condition: "time_to_conflict >= conflict_gap", next: cruise }
+    - id: move-left
+      kind: act
+      action: change-lane-left
+      transitions:
+        - { condition: "ego in left lane", next: cruise }
+        - { condition: "ego still changing", next: move-left }
+    - id: open-gap
+      kind: act
+      action: decelerate
+      transitions:
+        - { condition: "merging vehicle settled ahead", next: cruise }
+        - { condition: "conflict still possible", next: watch-ramp }
+    - id: cruise
+      kind: act
+      action: maintain-speed
+      transitions:
+        - { condition: "merging vehicle settled", next: done }
+        - { condition: "still near ramp", next: watch-ramp }
+
+effects:
+  - "merging vehicle entered the highway without conflict"
+  - "ego speed at or near target_speed"
+
+success_criteria:
+  - "merging vehicle merged successfully"
+  - "collision == false"
+
+failure_criteria:
+  - "collision == true"
+  - "ego forced to a full stop on the main highway"
+
+safety_constraints:
+  - "no overlap between ego bounding box and any other vehicle"
+  - "lane change only into a clear existing lane"
+
+failure_modes:
+  - "ignoring the merging vehicle until a late unavoidable conflict"
+  - "hard braking that disrupts following highway traffic"
+
+termination: "merging vehicle settled on the highway OR ramp passed"
+related_skills: [follow-keep-distance, lane-change-overtake]
+
+groundings:
+  - backend: highway-env
+    backend_version: ">=1.8"
+    environment: merge-v0
+    observation: { type: Kinematics, features: [presence, x, y, vx, vy, cos_h, sin_h] }
+    action: { type: DiscreteMetaAction }
+    primitive_map:
+      maintain-speed: IDLE
+      accelerate: FASTER
+      decelerate: SLOWER
+      change-lane-left: LANE_LEFT

@@ -1,0 +1,110 @@
+schema_version: "0.1"
+name: roundabout-navigate
+version: "1.0"
+domain: autonomous-driving
+category: interaction
+tags: [roundabout, yield, merge]
+
+description: >
+  Enter and traverse a roundabout, yielding to circulating traffic on entry
+  and leaving at the intended exit.
+
+entities:
+  - { name: ego, role: controlled-vehicle }
+  - { name: circulating_vehicles, role: traffic }
+  - { name: roundabout, role: static-topology }
+
+parameters:
+  target_speed:
+    type: float
+    unit: m/s
+    range: [0, 12]
+    default: 6
+    description: circulating speed inside the roundabout
+  entry_gap:
+    type: float
+    unit: s
+    range: [2, 6]
+    default: 3
+    description: minimum time gap in circulating traffic to accept entry
+
+interface:
+  observations:
+    - { name: circulating_vehicles, type: kinematic, features: [presence, x, y, vx, vy, heading] }
+    - { name: ego_state, type: kinematic }
+  actions:
+    - { name: longitudinal, type: discrete-meta, primitives: [maintain-speed, accelerate, decelerate] }
+
+preconditions:
+  - "ego approaching a roundabout entry"
+  - "ego.intent has an assigned exit"
+
+execution:
+  entry: approach
+  steps:
+    - id: approach
+      kind: observe
+      transitions:
+        - { condition: "always", next: entry-decide }
+    - id: entry-decide
+      kind: branch
+      transitions:
+        - { condition: "circulating_gap < entry_gap", next: yield-wait }
+        - { condition: "circulating_gap >= entry_gap", next: enter }
+    - id: yield-wait
+      kind: act
+      action: decelerate
+      transitions:
+        - { condition: "always", next: approach }
+    - id: enter
+      kind: act
+      action: accelerate
+      transitions:
+        - { condition: "ego inside ring", next: circulate }
+        - { condition: "ego still entering", next: enter }
+    - id: circulate
+      kind: act
+      action: maintain-speed
+      transitions:
+        - { condition: "approaching intended exit", next: exit }
+        - { condition: "not yet at exit", next: circulate }
+    - id: exit
+      kind: act
+      action: maintain-speed
+      transitions:
+        - { condition: "ego left the roundabout", next: done }
+        - { condition: "still exiting", next: exit }
+
+effects:
+  - "ego left the roundabout at the intended exit"
+  - "ego speed at or near target_speed"
+
+success_criteria:
+  - "ego took the intended exit"
+  - "collision == false"
+
+failure_criteria:
+  - "collision == true"
+  - "ego missed the intended exit"
+
+safety_constraints:
+  - "no overlap between ego bounding box and any other vehicle"
+  - "ego yields to circulating traffic on entry"
+
+failure_modes:
+  - "entering on a marginal gap forcing circulating traffic to brake"
+  - "missing the intended exit and looping again"
+
+termination: "ego exits the roundabout OR episode ends"
+related_skills: [unprotected-left-turn]
+
+groundings:
+  - backend: highway-env
+    backend_version: ">=1.8"
+    environment: roundabout-v0
+    observation: { type: Kinematics, features: [presence, x, y, vx, vy, cos_h, sin_h] }
+    action: { type: DiscreteMetaAction }
+    primitive_map:
+      maintain-speed: IDLE
+      accelerate: FASTER
+      decelerate: SLOWER

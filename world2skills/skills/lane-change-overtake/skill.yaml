@@ -1,0 +1,120 @@
+schema_version: "0.1"
+name: lane-change-overtake
+version: "1.0"
+domain: autonomous-driving
+category: lateral
+tags: [overtake, lane-change, highway]
+
+description: >
+  Change lanes on a multi-lane highway to overtake a slower lead vehicle
+  when an adjacent-lane gap is safe.
+
+entities:
+  - { name: ego, role: controlled-vehicle }
+  - { name: lead_vehicle, role: traffic }
+  - { name: adjacent_traffic, role: traffic }
+
+parameters:
+  target_speed:
+    type: float
+    unit: m/s
+    range: [0, 30]
+    default: 25
+    description: desired cruising speed
+  min_lane_gap:
+    type: float
+    unit: m
+    range: [10, 40]
+    default: 20
+    description: minimum clear distance in the target lane (front and rear)
+
+interface:
+  observations:
+    - { name: surrounding_vehicles, type: kinematic, features: [presence, x, y, vx, vy, heading] }
+    - { name: ego_state, type: kinematic }
+  actions:
+    - { name: lateral, type: discrete-meta, primitives: [change-lane-left, change-lane-right] }
+    - { name: longitudinal, type: discrete-meta, primitives: [maintain-speed, accelerate, decelerate] }
+
+preconditions:
+  - "ego.lane has a slower lead vehicle"
+  - "an adjacent lane exists"
+
+execution:
+  entry: check-lead
+  steps:
+    - id: check-lead
+      kind: observe
+      transitions:
+        - { condition: "lead_speed < target_speed", next: check-gap }
+        - { condition: "lead_speed >= target_speed", next: cruise }
+    - id: check-gap
+      kind: branch
+      transitions:
+        - { condition: "left_lane_exists and left_gap >= min_lane_gap", next: change-left }
+        - { condition: "(not left_lane_exists or left_gap < min_lane_gap) and right_lane_exists and right_gap >= min_lane_gap", next: change-right }
+        - { condition: "otherwise", next: follow }
+    - id: follow
+      kind: act
+      action: decelerate
+      transitions:
+        - { condition: "always", next: check-lead }
+    - id: change-left
+      kind: act
+      action: change-lane-left
+      transitions:
+        - { condition: "ego in target lane", next: pass }
+        - { condition: "ego still changing", next: change-left }
+    - id: change-right
+      kind: act
+      action: change-lane-right
+      transitions:
+        - { condition: "ego in target lane", next: pass }
+        - { condition: "ego still changing", next: change-right }
+    - id: pass
+      kind: act
+      action: accelerate
+      transitions:
+        - { condition: "ego ahead of overtaken vehicle", next: cruise }
+        - { condition: "ego not yet clear", next: pass }
+    - id: cruise
+      kind: act
+      action: maintain-speed
+      transitions:
+        - { condition: "always", next: done }
+
+effects:
+  - "ego ahead of the previously blocking lead vehicle"
+  - "ego speed at or near target_speed"
+
+success_criteria:
+  - "ego overtook the lead vehicle"
+  - "collision == false"
+
+failure_criteria:
+  - "collision == true"
+  - "ego forced back below target_speed behind the same vehicle"
+
+safety_constraints:
+  - "no overlap between ego bounding box and any other vehicle"
+  - "lane change only into a lane that exists"
+
+failure_modes:
+  - "changing into an occupied adjacent gap causing a side collision"
+  - "oscillating between lanes without net progress"
+
+termination: "ego past the lead vehicle at target speed OR overtake aborted"
+related_skills: [follow-keep-distance]
+
+groundings:
+  - backend: highway-env
+    backend_version: ">=1.8"
+    environment: highway-v0
+    observation: { type: Kinematics, features: [presence, x, y, vx, vy, cos_h, sin_h] }
+    action: { type: DiscreteMetaAction }
+    primitive_map:
+      maintain-speed: IDLE
+      accelerate: FASTER
+      decelerate: SLOWER
+      change-lane-left: LANE_LEFT
+      change-lane-right: LANE_RIGHT

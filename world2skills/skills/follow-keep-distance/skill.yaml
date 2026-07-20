@@ -1,0 +1,102 @@
+schema_version: "0.1"
+name: follow-keep-distance
+version: "1.0"
+domain: autonomous-driving
+category: longitudinal
+tags: [car-following, headway, cruise]
+
+description: >
+  Follow a lead vehicle in the same lane while keeping a safe time-gap
+  headway and matching its speed.
+
+entities:
+  - { name: ego, role: controlled-vehicle }
+  - { name: lead_vehicle, role: traffic }
+
+parameters:
+  target_speed:
+    type: float
+    unit: m/s
+    range: [0, 30]
+    default: 25
+    description: desired speed when unobstructed
+  target_headway:
+    type: float
+    unit: s
+    range: [1, 3]
+    default: 1.5
+    description: desired time gap to the lead vehicle
+
+interface:
+  observations:
+    - { name: lead_vehicle_state, type: kinematic, features: [presence, x, y, vx, vy] }
+    - { name: ego_state, type: kinematic }
+  actions:
+    - { name: longitudinal, type: discrete-meta, primitives: [maintain-speed, accelerate, decelerate] }
+
+preconditions:
+  - "a lead vehicle is present in ego.lane"
+
+execution:
+  entry: measure-gap
+  steps:
+    - id: measure-gap
+      kind: observe
+      transitions:
+        - { condition: "always", next: regulate }
+    - id: regulate
+      kind: branch
+      transitions:
+        - { condition: "headway < target_headway", next: brake }
+        - { condition: "headway > target_headway and ego_speed < target_speed", next: speed-up }
+        - { condition: "otherwise", next: hold }
+    - id: brake
+      kind: act
+      action: decelerate
+      transitions:
+        - { condition: "always", next: measure-gap }
+    - id: speed-up
+      kind: act
+      action: accelerate
+      transitions:
+        - { condition: "always", next: measure-gap }
+    - id: hold
+      kind: act
+      action: maintain-speed
+      transitions:
+        - { condition: "lead vehicle still present", next: measure-gap }
+        - { condition: "lead vehicle gone", next: done }
+
+effects:
+  - "ego headway within tolerance of target_headway"
+  - "ego speed tracks lead vehicle speed"
+
+success_criteria:
+  - "headway stays >= safe minimum for the episode"
+  - "collision == false"
+
+failure_criteria:
+  - "collision == true"
+  - "headway below safe minimum sustained > 3 s"
+
+safety_constraints:
+  - "ego never overlaps the lead vehicle"
+  - "headway never negative"
+
+failure_modes:
+  - "tailgating below safe headway with no braking margin"
+  - "over-braking on a brief transient gap reduction"
+
+termination: "lead vehicle leaves the lane OR episode ends"
+related_skills: [lane-change-overtake]
+
+groundings:
+  - backend: highway-env
+    backend_version: ">=1.8"
+    environment: highway-v0
+    observation: { type: Kinematics, features: [presence, x, y, vx, vy, cos_h, sin_h] }
+    action: { type: DiscreteMetaAction }
+    primitive_map:
+      maintain-speed: IDLE
+      accelerate: FASTER
+      decelerate: SLOWER

@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://world2skills/schema/skill.schema.json",
+  "title": "World2Skills autonomous-driving skill representation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "name", "version", "domain", "category",
+    "description", "entities", "interface", "preconditions",
+    "execution", "effects", "success_criteria", "failure_criteria",
+    "safety_constraints", "failure_modes", "termination", "groundings"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "name": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+    "version": { "type": "string" },
+    "domain": { "type": "string", "const": "autonomous-driving" },
+    "category": { "type": "string", "enum": ["longitudinal", "lateral", "interaction"] },
+    "tags": { "type": "array", "items": { "type": "string" } },
+    "description": { "type": "string", "minLength": 1 },
+    "entities": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["name", "role"],
+        "properties": {
+          "name": { "type": "string" },
+          "role": { "type": "string", "enum": ["controlled-vehicle", "traffic", "static-topology"] }
+        }
+      }
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object", "additionalProperties": false,
+        "required": ["type", "description"],
+        "properties": {
+          "type": { "type": "string", "enum": ["float", "int", "bool", "string"] },
+          "unit": { "type": "string" },
+          "range": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+          "default": {},
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "preconditions": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "effects": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "success_criteria": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "failure_criteria": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "safety_constraints": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "failure_modes": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "termination": { "type": "string", "minLength": 1 },
+    "related_skills": { "type": "array", "items": { "type": "string" } },
+    "interface": {
+      "type": "object", "additionalProperties": false,
+      "required": ["observations", "actions"],
+      "properties": {
+        "observations": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["name", "type"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string", "enum": ["kinematic", "image", "grid", "track"] },
+              "features": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "actions": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["name", "type", "primitives"],
+            "properties": {
+              "name": { "type": "string" },
+              "type": { "type": "string", "enum": ["discrete-meta", "continuous", "trajectory"] },
+              "primitives": {
+                "type": "array", "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "enum": ["maintain-speed", "accelerate", "decelerate", "change-lane-left", "change-lane-right"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["entry", "steps"],
+      "properties": {
+        "entry": { "type": "string" },
+        "steps": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["id", "kind", "transitions"],
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "kind": { "const": "act" } },
+                  "required": ["kind"]
+                },
+                "then": { "required": ["action"] },
+                "else": { "not": { "required": ["action"] } }
+              }
+            ],
+            "properties": {
+              "id": { "type": "string" },
+              "kind": { "type": "string", "enum": ["observe", "act", "branch"] },
+              "action": {
+                "type": "string",
+                "enum": ["maintain-speed", "accelerate", "decelerate", "change-lane-left", "change-lane-right"]
+              },
+              "transitions": {
+                "type": "array", "minItems": 1,
+                "items": {
+                  "type": "object", "additionalProperties": false,
+                  "required": ["condition", "next"],
+                  "properties": {
+                    "condition": { "type": "string" },
+                    "next": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "groundings": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["backend", "backend_version", "environment", "observation", "action", "primitive_map"],
+        "properties": {
+          "backend": { "type": "string" },
+          "backend_version": { "type": "string" },
+          "environment": { "type": "string" },
+          "observation": {
+            "type": "object", "additionalProperties": false,
+            "required": ["type"],
+            "properties": {
+              "type": { "type": "string" },
+              "features": { "type": "array", "items": { "type": "string" } }
+            }
+          },
+          "action": {
+            "type": "object", "additionalProperties": false,
+            "required": ["type"],
+            "properties": { "type": { "type": "string" } }
+          },
+          "primitive_map": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,103 @@
+schema_version: "0.1"
+name: unprotected-left-turn
+version: "1.0"
+domain: autonomous-driving
+category: interaction
+tags: [yield, unsignalized, left-turn]
+
+description: >
+  Turn left across oncoming traffic at an unsignalized intersection,
+  yielding to cross and oncoming vehicles.
+
+entities:
+  - { name: ego, role: controlled-vehicle }
+  - { name: oncoming_vehicles, role: traffic }
+  - { name: intersection, role: static-topology }
+
+parameters:
+  target_speed:
+    type: float
+    unit: m/s
+    range: [0, 10]
+    default: 4
+    description: cruising speed when the path is clear
+  yield_gap:
+    type: float
+    unit: s
+    range: [2, 6]
+    default: 3
+    description: minimum time gap to oncoming traffic before committing
+
+interface:
+  observations:
+    - { name: surrounding_vehicles, type: kinematic, features: [presence, x, y, vx, vy, heading] }
+    - { name: ego_state, type: kinematic }
+  actions:
+    - { name: longitudinal, type: discrete-meta, primitives: [maintain-speed, accelerate, decelerate] }
+
+preconditions:
+  - "intersection.signal == none"
+  - "ego.intent == turn_left"
+
+execution:
+  entry: assess-gap
+  steps:
+    - id: assess-gap
+      kind: observe
+      transitions:
+        - { condition: "always", next: decide }
+    - id: decide
+      kind: branch
+      transitions:
+        - { condition: "gap < yield_gap", next: wait }
+        - { condition: "gap >= yield_gap", next: commit }
+    - id: wait
+      kind: act
+      action: decelerate
+      transitions:
+        - { condition: "always", next: assess-gap }
+    - id: commit
+      kind: act
+      action: accelerate
+      transitions:
+        - { condition: "ego past conflict zone", next: clear }
+        - { condition: "ego not yet clear", next: commit }
+    - id: clear
+      kind: act
+      action: maintain-speed
+      transitions:
+        - { condition: "always", next: done }
+
+effects:
+  - "ego.position beyond intersection on the west approach"
+  - "ego.heading aligned with target lane"
+
+success_criteria:
+  - "crossed_intersection == true"
+  - "collision == false"
+
+failure_criteria:
+  - "collision == true"
+  - "ego stalled in conflict zone for > 10 s"
+
+safety_constraints:
+  - "no overlap between ego bounding box and any other vehicle"
+  - "ego stays within drivable area"
+
+failure_modes:
+  - "enters intersection without sufficient gap causing a collision"
+  - "over-cautious freeze blocking the intersection"
+
+termination: "ego past intersection OR aborted on imminent collision"
+related_skills: [follow-keep-distance]
+
+groundings:
+  - backend: highway-env
+    backend_version: ">=1.8"
+    environment: intersection-v0
+    observation: { type: Kinematics, features: [presence, x, y, vx, vy, cos_h, sin_h] }
+    action: { type: DiscreteMetaAction }
+    primitive_map:
+      maintain-speed: IDLE
+      accelerate: FASTER
+      decelerate: SLOWER
