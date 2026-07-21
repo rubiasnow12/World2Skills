@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -409,27 +410,13 @@ def test_client_constructor_failure_writes_one_error_per_seed(
     assert config["client"]["construction_error"].startswith("RuntimeError:")
     assert config["client"]["model"] is None
     environment = config["environment_config"]
-    assert environment["lanes_count"] == 4
-    assert environment["duration"] == 40
-    assert "obs_vehicles_count" not in environment
-    assert environment["observation"] == {
-        "type": "Kinematics",
-        "features": [
-            "presence",
-            "x",
-            "y",
-            "vx",
-            "vy",
-            "cos_h",
-            "sin_h",
-        ],
-        "vehicles_count": 8,
-        "normalize": False,
-        "absolute": False,
-        "see_behind": True,
-        "order": "sorted",
-    }
-    assert environment["action"] == {"type": "DiscreteMetaAction"}
+    card = run.load_skill("lane-change-overtake")
+    grounding = run.select_grounding(card, "highway-env")
+    expected = run.resolve_env_config(
+        grounding,
+        run.LaneChangeOvertakeScenario.configure(),
+    )
+    assert environment == expected
 
 
 def test_all_seed_env_failures_use_deterministic_environment_fallback(
@@ -467,10 +454,12 @@ def test_all_seed_env_failures_use_deterministic_environment_fallback(
     results = _read_json(out / "results.json")
     assert results["error_episodes"] == 2
     environment = _read_json(out / "config.json")["environment_config"]
-    assert environment["controlled_vehicles"] == 1
-    assert environment["observation"]["vehicles_count"] == 8
-    assert environment["observation"]["features"][0] == "presence"
-    assert environment["action"]["type"] == "DiscreteMetaAction"
+    card = run.load_skill("lane-change-overtake")
+    grounding = run.select_grounding(card, "highway-env")
+    assert environment == run.resolve_env_config(
+        grounding,
+        run.LaneChangeOvertakeScenario.configure(),
+    )
     assert client.close_calls == 1
 
 
@@ -518,49 +507,6 @@ def test_all_scenario_constructor_failures_still_publish_environment_config(
     assert environment["observation"]["vehicles_count"] == 8
     assert environment["action"] == {"type": "DiscreteMetaAction"}
     assert client.close_calls == 1
-
-
-def test_environment_fallback_helper_is_pure_and_consumes_obs_count() -> None:
-    card = run.load_skill("lane-change-overtake")
-    grounding = run.select_grounding(card, "highway-env")
-    scenario_config = {
-        "duration": 12,
-        "policy_frequency": 2,
-        "obs_vehicles_count": 5,
-    }
-
-    resolved = run._resolved_custom_environment_config(
-        grounding,
-        scenario_config,
-    )
-
-    assert scenario_config == {
-        "duration": 12,
-        "policy_frequency": 2,
-        "obs_vehicles_count": 5,
-    }
-    assert resolved == {
-        "duration": 12,
-        "policy_frequency": 2,
-        "observation": {
-            "type": "Kinematics",
-            "features": [
-                "presence",
-                "x",
-                "y",
-                "vx",
-                "vy",
-                "cos_h",
-                "sin_h",
-            ],
-            "vehicles_count": 5,
-            "normalize": False,
-            "absolute": False,
-            "see_behind": True,
-            "order": "sorted",
-        },
-        "action": {"type": "DiscreteMetaAction"},
-    }
 
 
 def test_client_constructor_error_redacts_secret_environment_values(
@@ -624,10 +570,11 @@ def test_actual_client_identity_and_resolved_env_config_are_recorded(
     assert rc == 0
     config = _read_json(out / "config.json")
     assert config["requested"]["model"] == "gpt-5.4-requested"
+    path_hash = hashlib.sha256("/openai".encode()).hexdigest()[:16]
     assert config["client"] == {
         "api_type": "fake-responses",
         "api_version": "2099-01-01",
-        "base_url": "https://example.test/%3Credacted-path%3E",
+        "base_url": f"https://example.test/_path_sha256_{path_hash}/",
         "close_error": None,
         "constructed": True,
         "construction_error": None,
@@ -640,15 +587,26 @@ def test_actual_client_identity_and_resolved_env_config_are_recorded(
     assert [env.close_calls for env in envs] == [1]
 
 
-def test_sanitize_endpoint_keeps_only_origin_and_constant_path_marker() -> None:
+def test_sanitize_endpoint_hashes_normalized_path_without_leaking_it() -> None:
     endpoint = (
         "https://user-secret:password-secret@example.test:8443/"
         "path-secret/nested?token=query-secret#fragment-secret"
     )
 
     sanitized = run._sanitize_endpoint(endpoint)
+    same_path = run._sanitize_endpoint(
+        "https://example.test:8443/path-secret/./nested/"
+    )
+    encoded_same_path = run._sanitize_endpoint(
+        "https://example.test:8443/%70ath-secret/nested"
+    )
+    different_path = run._sanitize_endpoint("https://example.test:8443/openai")
 
-    assert sanitized == "https://example.test:8443/%3Credacted-path%3E"
+    expected_hash = hashlib.sha256("/path-secret/nested".encode()).hexdigest()[:16]
+    assert sanitized == (f"https://example.test:8443/_path_sha256_{expected_hash}/")
+    assert same_path == sanitized
+    assert encoded_same_path == sanitized
+    assert different_path != sanitized
     for secret in (
         "user-secret",
         "password-secret",
@@ -658,6 +616,7 @@ def test_sanitize_endpoint_keeps_only_origin_and_constant_path_marker() -> None:
         "fragment-secret",
     ):
         assert secret not in sanitized
+    assert "openai" not in different_path
 
     assert (
         run._sanitize_endpoint(

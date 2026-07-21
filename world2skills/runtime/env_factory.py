@@ -138,6 +138,37 @@ def _resolved_config(
     return config
 
 
+def _complete_resolved_config(
+    env: Any,
+    scenario_config: dict[str, Any],
+    features: list[str],
+) -> dict[str, Any]:
+    default_config = env.unwrapped.default_config()
+    if not isinstance(default_config, Mapping):
+        raise ValueError("highway-env default_config() must return a mapping")
+    resolved = dict(deepcopy(default_config))
+    resolved.update(
+        _resolved_config(
+            scenario_config,
+            features,
+            default_config,
+        )
+    )
+    if resolved.get("offscreen_rendering") is None:
+        resolved["offscreen_rendering"] = env.render_mode != "human"
+    return resolved
+
+
+def _make_unconfigured_env(grounding: Grounding) -> Any:
+    import gymnasium
+    import highway_env  # noqa: F401 - import registers highway-env IDs
+
+    return gymnasium.make(
+        grounding.environment,
+        render_mode=None,
+    )
+
+
 def _validate_core_scenario_values(
     config: Mapping[str, Any],
     default_config: Mapping[str, Any],
@@ -249,6 +280,26 @@ def _validate_backend_actions(
         )
 
 
+def resolve_env_config(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the complete validated config without retaining a probe env."""
+
+    features = _validate_grounding(grounding)
+    env = None
+    try:
+        env = _make_unconfigured_env(grounding)
+        return _complete_resolved_config(
+            env,
+            scenario_config,
+            features,
+        )
+    finally:
+        if env is not None:
+            env.close()
+
+
 def make_env(
     grounding: Grounding,
     scenario_config: dict[str, Any],
@@ -258,22 +309,13 @@ def make_env(
 
     features = _validate_grounding(grounding)
 
-    import gymnasium
-    import highway_env  # noqa: F401 - import registers highway-env IDs
-
     env = None
     try:
-        env = gymnasium.make(
-            grounding.environment,
-            render_mode=None,
-        )
-        default_config = env.unwrapped.default_config()
-        if not isinstance(default_config, Mapping):
-            raise ValueError("highway-env default_config() must return a mapping")
-        config = _resolved_config(
+        env = _make_unconfigured_env(grounding)
+        config = _complete_resolved_config(
+            env,
             scenario_config,
             features,
-            default_config,
         )
         env.unwrapped.configure(config)
         obs, _ = env.reset(seed=seed)

@@ -13,7 +13,7 @@ import pytest
 
 pytest.importorskip("highway_env")
 
-from world2skills.runtime.env_factory import make_env
+from world2skills.runtime.env_factory import make_env, resolve_env_config
 from world2skills.runtime.skill_loader import load_skill, select_grounding
 from world2skills.runtime.types import Grounding
 
@@ -40,6 +40,7 @@ def scenario_config() -> dict[str, Any]:
 class _TrackingEnv:
     def __init__(self, reset_error: Exception | None = None) -> None:
         self.unwrapped = self
+        self.render_mode = None
         self.closed = False
         self.configured_with: dict[str, Any] | None = None
         self.reset_error = reset_error
@@ -138,6 +139,58 @@ def test_make_env_returns_resolved_kinematics_config_and_action_map(
         assert installed in SpecifierSet(grounding.backend_version)
     finally:
         env.close()
+
+
+def test_resolve_env_config_equals_real_make_env_config(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    config_before = deepcopy(scenario_config)
+
+    resolved = resolve_env_config(grounding, scenario_config)
+    env, _ = make_env(grounding, scenario_config, seed=0)
+    try:
+        assert resolved == env.unwrapped.config
+        assert resolved is not env.unwrapped.config
+        assert (
+            resolved["controlled_vehicles"]
+            == (env.unwrapped.default_config()["controlled_vehicles"])
+        )
+        assert scenario_config == config_before
+    finally:
+        env.close()
+
+
+def test_resolve_env_config_always_closes_probe_env(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    fake_env, make_kwargs = _patch_make(monkeypatch, grounding)
+
+    resolved = resolve_env_config(grounding, scenario_config)
+
+    assert fake_env.closed is True
+    assert fake_env.configured_with is None
+    assert make_kwargs == {"render_mode": None}
+    assert resolved["controlled_vehicles"] == 1
+    assert resolved["vehicles_count"] == scenario_config["vehicles_count"]
+    assert resolved["observation"]["vehicles_count"] == 8
+
+
+def test_resolve_env_config_closes_probe_when_validation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    scenario_config["vehcles_count"] = 10
+    fake_env, _ = _patch_make(monkeypatch, grounding)
+
+    with pytest.raises(ValueError, match="vehcles_count"):
+        resolve_env_config(grounding, scenario_config)
+
+    assert fake_env.closed is True
+    assert fake_env.configured_with is None
 
 
 def test_same_seed_produces_same_initial_observation_and_action_samples(
