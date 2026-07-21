@@ -876,9 +876,12 @@ def test_endpoint_path_variants_redact_standalone_but_preserve_larger_words(
     ).hexdigest()[:16]
 
     redacted = run._redact_secrets(
-        f"error {raw_path} {raw_segment} {decoded_path} {segment} "
-        f"{raw_query_value} {decoded_query_value} "
-        f"{segment}suffix unrelated {endpoint}"
+        (
+            f"error {raw_path} {raw_segment} {decoded_path} {segment} "
+            f"{raw_query_value} {decoded_query_value} "
+            f"{segment}suffix unrelated {endpoint}"
+        ),
+        include_endpoint_path_variants=True,
     )
 
     assert redacted == (
@@ -886,6 +889,139 @@ def test_endpoint_path_variants_redact_standalone_but_preserve_larger_words(
         "<redacted> <redacted> "
         f"{segment}suffix unrelated "
         f"https://example.test/_path_sha256_{expected_hash}/"
+    )
+
+
+def test_endpoint_path_variants_only_apply_to_error_and_trace_text(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    endpoint = "https://example.test/openai/v1"
+    monkeypatch.setenv("OPENAI_BASE_URL", endpoint)
+    client = _FakeClient(model="openai")
+    client.api_type = "openai"
+    client.api_version = "v1"
+    client.base_url = endpoint
+    _patch_fast_success(monkeypatch, client=client)
+
+    def path_error_episode(
+        env: _FakeEnv,
+        executor: Any,
+        scenario: Any,
+        seed: int,
+        max_steps: int,
+    ) -> EpisodeResult:
+        del executor, scenario, max_steps
+        env.close()
+        step = StepRecord(
+            t=0,
+            obs_summary="obs /openai/v1 openai v1",
+            primitive="maintain-speed",
+            backend_action="IDLE",
+            action_index=1,
+            reward=0.0,
+            crashed=False,
+            request_hash="request-hash",
+            raw_response="provider /openai/v1 openai v1",
+            cache_hit=False,
+            latency_ms=1.0,
+            decision_status="parse_fallback",
+            fallback_reason="failure openai v1",
+            available_primitives=["maintain-speed"],
+        )
+        return EpisodeResult(
+            seed=seed,
+            status="ok",
+            success=False,
+            success_reason="",
+            episode_return=0.0,
+            crashed=False,
+            steps=1,
+            mean_speed=0.0,
+            parse_failures=1,
+            unavailable_action_attempts=0,
+            llm_errors=0,
+            terminated=False,
+            truncated=False,
+            max_steps_reached=True,
+            scenario_completed=False,
+            termination_reason="max_steps",
+            target_initially_ahead=False,
+            lane_change_completed_step=None,
+            overtake_step=None,
+            exception_message="setup /openai/v1 openai v1",
+            step_records=[step],
+        )
+
+    monkeypatch.setattr(run, "run_episode", path_error_episode)
+    out = tmp_path / "path-mode-split"
+
+    assert (
+        run.main(
+            [
+                "--seeds",
+                "0",
+                "--model",
+                "gpt-5.4",
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+
+    config = _read_json(out / "config.json")
+    results = _read_json(out / "results.json")
+    trace = json.loads((out / "episode_0.jsonl").read_text(encoding="utf-8"))
+    assert config["client"]["model"] == "openai"
+    assert config["client"]["api_type"] == "openai"
+    assert config["client"]["api_version"] == "v1"
+    assert config["prompt_version"] == "lco-v1"
+    assert results["model"] == "openai"
+    assert results["results"][0]["exception_message"] == (
+        "setup <redacted> <redacted> <redacted>"
+    )
+    assert trace["raw_response"] == ("provider <redacted> <redacted> <redacted>")
+    assert trace["fallback_reason"] == "failure <redacted> <redacted>"
+    assert trace["obs_summary"] == "obs <redacted> <redacted> <redacted>"
+
+
+def test_identity_endpoint_path_does_not_alter_controlled_snapshot_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    endpoint = "https://identity.test/common/path"
+    monkeypatch.setenv("IDENTITY_ENDPOINT", endpoint)
+    safe_endpoint = run._sanitize_endpoint(endpoint)
+    assert safe_endpoint is not None
+
+    sanitized = run._sanitize_snapshot(
+        {
+            "client": {
+                "base_url": safe_endpoint,
+                "model": "common",
+                "api_type": "path",
+                "api_version": "common",
+            },
+            "prompt_version": "common",
+            "skill": {"name": "path"},
+            "environment": "common",
+            "installed_versions": {"common": "1.2.3"},
+            "construction_error": "failed /common/path common path",
+        }
+    )
+
+    assert sanitized["client"] == {
+        "base_url": safe_endpoint,
+        "model": "common",
+        "api_type": "path",
+        "api_version": "common",
+    }
+    assert sanitized["prompt_version"] == "common"
+    assert sanitized["skill"]["name"] == "path"
+    assert sanitized["environment"] == "common"
+    assert sanitized["installed_versions"] == {"common": "1.2.3"}
+    assert sanitized["construction_error"] == (
+        "failed <redacted> <redacted> <redacted>"
     )
 
 

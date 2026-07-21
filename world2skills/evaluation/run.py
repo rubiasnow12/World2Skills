@@ -106,6 +106,15 @@ _SENSITIVE_QUERY_MARKERS = (
     "auth",
     "authorization",
 )
+_PATH_VARIANT_SNAPSHOT_KEYS = frozenset(
+    {
+        "construction_error",
+        "close_error",
+        "resolution_error",
+        "build_error",
+        "snapshot_error",
+    }
+)
 
 
 def _nonnegative_seed(value: str) -> int:
@@ -431,17 +440,26 @@ def _exception_text(error: Exception | None) -> str | None:
     notes = getattr(error, "__notes__", ())
     if notes:
         rendered += " | notes: " + " | ".join(str(note) for note in notes)
-    return _redact_secrets(rendered)
+    return _redact_secrets(
+        rendered,
+        include_endpoint_path_variants=True,
+    )
 
 
-def _redact_secrets(text: str) -> str:
+def _redact_secrets(
+    text: str,
+    include_endpoint_path_variants: bool = False,
+) -> str:
     redacted = _URL.sub(_redact_url_match, str(text))
     variants: set[str] = set()
     boundary_only: set[str] = set()
     for name, value in os.environ.items():
         if value and any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS):
             variants.update(_secret_variants(name, value))
-            boundary_only.update(_endpoint_path_variants(name, value))
+            if include_endpoint_path_variants:
+                path_variants = _endpoint_path_variants(name, value)
+                variants.update(path_variants)
+                boundary_only.update(path_variants)
     for value in sorted(variants, key=len, reverse=True):
         if len(value) >= 8 and value not in boundary_only:
             redacted = redacted.replace(value, _REDACTION)
@@ -488,7 +506,6 @@ def _secret_variants(name: str, value: str) -> set[str]:
                 variants.add(query_value)
                 variants.add(unquote(query_value))
         variants.update(_raw_sensitive_query_variants(parsed.query))
-        variants.update(_endpoint_path_variants(name, value))
     return {variant for variant in variants if _informative_secret_variant(variant)}
 
 
@@ -560,7 +577,14 @@ def _sanitize_episode_results(
         ):
             value = getattr(result, field_name)
             if isinstance(value, str):
-                setattr(result, field_name, _redact_secrets(value))
+                setattr(
+                    result,
+                    field_name,
+                    _redact_secrets(
+                        value,
+                        include_endpoint_path_variants=True,
+                    ),
+                )
         for record in result.step_records:
             for field_name in (
                 "raw_response",
@@ -569,7 +593,14 @@ def _sanitize_episode_results(
             ):
                 value = getattr(record, field_name)
                 if isinstance(value, str):
-                    setattr(record, field_name, _redact_secrets(value))
+                    setattr(
+                        record,
+                        field_name,
+                        _redact_secrets(
+                            value,
+                            include_endpoint_path_variants=True,
+                        ),
+                    )
     return sanitized
 
 
@@ -577,7 +608,10 @@ def _sanitize_snapshot(value: Any, key: str | None = None) -> Any:
     if isinstance(value, str):
         if key == "base_url":
             return value
-        return _redact_secrets(value)
+        return _redact_secrets(
+            value,
+            include_endpoint_path_variants=_snapshot_key_uses_path_variants(key),
+        )
     if isinstance(value, dict):
         return {
             item_key: _sanitize_snapshot(
@@ -591,6 +625,17 @@ def _sanitize_snapshot(value: Any, key: str | None = None) -> Any:
     if isinstance(value, tuple):
         return tuple(_sanitize_snapshot(item) for item in value)
     return deepcopy(value)
+
+
+def _snapshot_key_uses_path_variants(key: str | None) -> bool:
+    if key is None:
+        return False
+    normalized = key.lower()
+    return (
+        normalized in _PATH_VARIANT_SNAPSHOT_KEYS
+        or "exception" in normalized
+        or "cleanup" in normalized
+    )
 
 
 def _close_resource(resource: Any) -> str | None:
@@ -618,7 +663,12 @@ def _cleanup_errors_from_notes(error: Exception) -> list[str]:
         if text.startswith(prefix):
             value = text[len(prefix) :].strip()
             if value:
-                values.append(_redact_secrets(value))
+                values.append(
+                    _redact_secrets(
+                        value,
+                        include_endpoint_path_variants=True,
+                    )
+                )
     return values
 
 
@@ -628,7 +678,12 @@ def _merged_cleanup_error(
 ) -> str | None:
     values = []
     if explicit:
-        values.append(_redact_secrets(explicit))
+        values.append(
+            _redact_secrets(
+                explicit,
+                include_endpoint_path_variants=True,
+            )
+        )
     for value in _cleanup_errors_from_notes(error):
         if value not in values:
             values.append(value)
@@ -669,7 +724,10 @@ def _error_episode(
         overtake_step=None,
         lead_initial_gap_m=float(lead_gap) if lead_gap is not None else None,
         exception_type=type(error).__name__,
-        exception_message=_redact_secrets(str(error)),
+        exception_message=_redact_secrets(
+            str(error),
+            include_endpoint_path_variants=True,
+        ),
         cleanup_error=_merged_cleanup_error(cleanup_error, error),
     )
 
