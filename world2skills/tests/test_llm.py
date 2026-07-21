@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -67,6 +69,39 @@ class RecordingFactory:
         return self.provider
 
 
+class BlockingCreate:
+    def __init__(self, outcome: Any):
+        self.outcome = outcome
+        self.calls: list[dict[str, Any]] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        self.started.set()
+        if not self.release.wait(timeout=2):
+            raise TimeoutError("test did not release provider call")
+        return self.outcome
+
+
+class WaitForConcurrentCreate:
+    def __init__(self, outcome: Any):
+        self.outcome = outcome
+        self.calls: list[dict[str, Any]] = []
+        self._calls_lock = threading.Lock()
+        self._second_call_started = threading.Event()
+
+    def __call__(self, **kwargs: Any) -> Any:
+        with self._calls_lock:
+            self.calls.append(kwargs)
+            call_count = len(self.calls)
+            if call_count == 2:
+                self._second_call_started.set()
+        if call_count == 1:
+            self._second_call_started.wait(timeout=0.5)
+        return self.outcome
+
+
 def _chat_response(reply: str | None) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=reply))]
@@ -126,6 +161,17 @@ def test_request_hash_is_canonical_and_deterministic():
     }
 
     assert make_request_hash(**kwargs) == make_request_hash(**reordered)
+
+
+def test_request_hash_treats_equivalent_base_urls_as_same_endpoint():
+    kwargs = _hash_kwargs()
+
+    without_slash = make_request_hash(**kwargs)
+    with_extra_slashes = make_request_hash(
+        **{**kwargs, "base_url": "https://example.test/v1///"}
+    )
+
+    assert without_slash == with_extra_slashes
 
 
 @pytest.mark.parametrize(
@@ -199,7 +245,7 @@ def test_openai_chat_completions_sends_effective_settings_and_disables_sdk_retry
     assert factory.calls == [
         {
             "api_key": "test-key",
-            "base_url": "https://chat.test/v1",
+            "base_url": "https://chat.test/v1/",
             "timeout": 600.0,
             "max_retries": 0,
         }
@@ -216,6 +262,42 @@ def test_openai_chat_completions_sends_effective_settings_and_disables_sdk_retry
             "extra_body": {"guided_json": {"type": "object"}},
         }
     ]
+
+
+def test_provider_receives_canonical_base_url_and_endpoint_fields_are_read_only():
+    provider = FakeOpenAIProvider(chat_outcomes=[_chat_response("ok")])
+    factory = RecordingFactory(provider)
+    client = OpenAIClient(
+        model="m",
+        base_url="https://chat.test/v1///",
+        api_type="local-openai",
+        api_version="compat-v1",
+        use_cache=False,
+        retry_delays=(),
+        client_factory=factory,
+    )
+
+    result = client.chat(MESSAGES, prompt_version="pv")
+
+    assert factory.calls[0]["base_url"] == "https://chat.test/v1/"
+    assert client.base_url == "https://chat.test/v1/"
+    assert client.api_type == "local-openai"
+    assert client.api_version == "compat-v1"
+    assert result.request_hash == make_request_hash(
+        client_type="OpenAIClient",
+        model="m",
+        api_type="local-openai",
+        base_url="https://chat.test/v1/",
+        api_version="compat-v1",
+        effective_settings={"temperature": 0.0},
+        messages=MESSAGES,
+        prompt_version="pv",
+    )
+    assert {"base_url", "api_type", "api_version"}.isdisjoint(vars(client))
+    for field_name in ("base_url", "api_type", "api_version"):
+        with pytest.raises(AttributeError):
+            setattr(client, field_name, "changed")
+    client.close()
 
 
 def test_azure_responses_sends_effective_settings_and_endpoint_identity():
@@ -525,6 +607,104 @@ def test_failed_request_is_not_cached(tmp_path):
     assert recovered.cache_hit is False
     assert cached.cache_hit is True
     assert len(provider.chat_create.calls) == 2
+
+
+def test_chat_after_close_raises_clear_runtime_error(tmp_path):
+    provider = FakeOpenAIProvider(chat_outcomes=[_chat_response("unexpected")])
+    client = OpenAIClient(
+        model="m",
+        use_cache=True,
+        cache_path=tmp_path / "cache",
+        retry_delays=(),
+        client_factory=RecordingFactory(provider),
+    )
+
+    client.close()
+
+    assert client.closed is True
+    with pytest.raises(RuntimeError, match="LLM client is closed"):
+        client.chat(MESSAGES, prompt_version="pv")
+    assert provider.chat_create.calls == []
+
+
+def test_close_waits_for_in_flight_chat_before_closing_provider():
+    blocking_create = BlockingCreate(_chat_response("done"))
+    provider = FakeOpenAIProvider(chat_outcomes=[])
+    provider.chat_create = blocking_create
+    provider.chat.completions.create = blocking_create
+    client = OpenAIClient(
+        model="m",
+        use_cache=False,
+        retry_delays=(),
+        client_factory=RecordingFactory(provider),
+    )
+    close_started = threading.Event()
+    close_finished = threading.Event()
+
+    def close_client() -> None:
+        close_started.set()
+        client.close()
+        close_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        chat_future = pool.submit(client.chat, MESSAGES, None, "pv")
+        assert blocking_create.started.wait(timeout=1)
+        close_future = pool.submit(close_client)
+        assert close_started.wait(timeout=1)
+        try:
+            assert not close_finished.wait(timeout=0.1)
+        finally:
+            blocking_create.release.set()
+        assert chat_future.result(timeout=1).reply == "done"
+        close_future.result(timeout=1)
+
+    assert close_finished.is_set()
+    assert provider.close_calls == 1
+    assert client.closed is True
+
+
+def test_concurrent_identical_cache_misses_invoke_provider_once(tmp_path):
+    concurrent_create = WaitForConcurrentCreate(_chat_response("shared"))
+    provider = FakeOpenAIProvider(chat_outcomes=[])
+    provider.chat_create = concurrent_create
+    provider.chat.completions.create = concurrent_create
+    factory = RecordingFactory(provider)
+    clients = [
+        OpenAIClient(
+            model="m",
+            base_url="https://chat.test/v1",
+            use_cache=True,
+            cache_path=tmp_path / "cache",
+            retry_delays=(),
+            client_factory=factory,
+        ),
+        OpenAIClient(
+            model="m",
+            base_url="https://chat.test/v1/",
+            use_cache=True,
+            cache_path=tmp_path / "cache",
+            retry_delays=(),
+            client_factory=factory,
+        ),
+    ]
+    start = threading.Barrier(3)
+
+    def invoke(client: OpenAIClient) -> ChatResult:
+        start.wait(timeout=1)
+        return client.chat(MESSAGES, prompt_version="pv")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(invoke, client) for client in clients]
+        start.wait(timeout=1)
+        results = [future.result(timeout=2) for future in futures]
+
+    for client in clients:
+        client.close()
+
+    assert [result.reply for result in results] == ["shared", "shared"]
+    assert sorted(result.cache_hit for result in results) == [False, True]
+    assert results[0].request_hash == results[1].request_hash
+    assert len(concurrent_create.calls) == 1
 
 
 def test_close_is_idempotent(tmp_path):

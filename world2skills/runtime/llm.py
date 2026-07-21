@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -13,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from diskcache import Cache
+from diskcache import Cache, Lock
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -91,6 +92,10 @@ def _message_payload(messages: Sequence[Message]) -> list[dict[str, str]]:
     return [{"role": message.role, "content": message.content} for message in messages]
 
 
+def _canonicalize_base_url(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}/"
+
+
 def make_request_hash(
     *,
     client_type: str,
@@ -109,7 +114,7 @@ def make_request_hash(
         "model": model,
         "endpoint_identity": {
             "api_type": api_type,
-            "base_url": base_url,
+            "base_url": _canonicalize_base_url(base_url),
             "api_version": api_version,
         },
         "effective_settings": effective_settings,
@@ -127,6 +132,19 @@ def make_request_hash(
 
 
 class LLMClient(ABC):
+    def __init__(self) -> None:
+        self._state_lock = threading.RLock()
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        with self._state_lock:
+            return self._closed
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("LLM client is closed")
+
     @abstractmethod
     def chat(
         self,
@@ -138,6 +156,8 @@ class LLMClient(ABC):
 
     def close(self) -> None:
         """Release client resources."""
+        with self._state_lock:
+            self._closed = True
 
 
 class MockLLMClient(LLMClient):
@@ -147,6 +167,7 @@ class MockLLMClient(LLMClient):
         self,
         replies: Sequence[str] | Callable[[Sequence[Message]], str],
     ):
+        super().__init__()
         if not callable(replies) and not replies:
             raise ValueError("MockLLMClient requires at least one reply")
         self._replies = replies
@@ -158,29 +179,31 @@ class MockLLMClient(LLMClient):
         settings: ModelSettings | None = None,
         prompt_version: str = "",
     ) -> ChatResult:
-        settings = settings or ModelSettings()
-        if callable(self._replies):
-            reply = self._replies(messages)
-        else:
-            reply = self._replies[self._index % len(self._replies)]
-            self._index += 1
-        effective_settings = settings.for_chat_completions()
-        request_hash = make_request_hash(
-            client_type=type(self).__name__,
-            model="mock",
-            api_type="mock",
-            base_url="mock://local",
-            api_version="",
-            effective_settings=effective_settings,
-            messages=messages,
-            prompt_version=prompt_version,
-        )
-        return ChatResult(
-            reply=reply,
-            request_hash=request_hash,
-            cache_hit=False,
-            latency_ms=0.0,
-        )
+        with self._state_lock:
+            self._ensure_open()
+            settings = settings or ModelSettings()
+            if callable(self._replies):
+                reply = self._replies(messages)
+            else:
+                reply = self._replies[self._index % len(self._replies)]
+                self._index += 1
+            effective_settings = settings.for_chat_completions()
+            request_hash = make_request_hash(
+                client_type=type(self).__name__,
+                model="mock",
+                api_type="mock",
+                base_url="mock://local",
+                api_version="",
+                effective_settings=effective_settings,
+                messages=messages,
+                prompt_version=prompt_version,
+            )
+            return ChatResult(
+                reply=reply,
+                request_hash=request_hash,
+                cache_hit=False,
+                latency_ms=0.0,
+            )
 
 
 class _CachedOpenAIClient(LLMClient):
@@ -197,22 +220,34 @@ class _CachedOpenAIClient(LLMClient):
         sleeper: Callable[[float], None],
         clock: Callable[[], float],
     ):
+        super().__init__()
         self.model = model
-        self.api_type = api_type
-        self.base_url = base_url
-        self.api_version = api_version
+        self._api_type = api_type
+        self._base_url = _canonicalize_base_url(base_url)
+        self._api_version = api_version
         self.retry_delays = tuple(retry_delays)
         self._sleeper = sleeper
         self._clock = clock
         self._cache: Cache | None = None
-        self._provider_closed = False
         if use_cache:
             cache_dir = Path(
                 cache_path
                 or Path.home() / ".cache" / "world2skills" / "llm"
             ).expanduser()
             cache_dir.mkdir(parents=True, exist_ok=True)
-            self._cache = Cache(str(cache_dir))
+            self._cache = Cache(str(cache_dir), eviction_policy="none")
+
+    @property
+    def api_type(self) -> str:
+        return self._api_type
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def api_version(self) -> str:
+        return self._api_version
 
     @abstractmethod
     def _effective_settings(self, settings: ModelSettings) -> dict[str, Any]:
@@ -258,6 +293,16 @@ class _CachedOpenAIClient(LLMClient):
         settings: ModelSettings | None = None,
         prompt_version: str = "",
     ) -> ChatResult:
+        with self._state_lock:
+            self._ensure_open()
+            return self._chat_while_open(messages, settings, prompt_version)
+
+    def _chat_while_open(
+        self,
+        messages: Sequence[Message],
+        settings: ModelSettings | None,
+        prompt_version: str,
+    ) -> ChatResult:
         settings = settings or ModelSettings()
         message_list = list(messages)
         effective_settings = self._effective_settings(settings)
@@ -279,10 +324,38 @@ class _CachedOpenAIClient(LLMClient):
                 latency_ms=0.0,
             )
 
+        if self._cache is not None:
+            lock_key = ("world2skills.llm.request", request_hash)
+            with Lock(self._cache, lock_key):
+                if request_hash in self._cache:
+                    return ChatResult(
+                        reply=self._cache[request_hash],
+                        request_hash=request_hash,
+                        cache_hit=True,
+                        latency_ms=0.0,
+                    )
+                return self._request_provider(
+                    message_list,
+                    effective_settings,
+                    request_hash,
+                )
+
+        return self._request_provider(
+            message_list,
+            effective_settings,
+            request_hash,
+        )
+
+    def _request_provider(
+        self,
+        messages: list[Message],
+        effective_settings: Mapping[str, Any],
+        request_hash: str,
+    ) -> ChatResult:
         started_at = self._clock()
         try:
             reply = self._call_with_retry(
-                _message_payload(message_list),
+                _message_payload(messages),
                 effective_settings,
             )
         except Exception as error:
@@ -305,14 +378,17 @@ class _CachedOpenAIClient(LLMClient):
         )
 
     def close(self) -> None:
-        if self._cache is not None:
-            self._cache.close()
-            self._cache = None
-        provider = getattr(self, "_client", None)
-        provider_close = getattr(provider, "close", None)
-        if not self._provider_closed and callable(provider_close):
-            provider_close()
-            self._provider_closed = True
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._cache is not None:
+                self._cache.close()
+                self._cache = None
+            provider = getattr(self, "_client", None)
+            provider_close = getattr(provider, "close", None)
+            if callable(provider_close):
+                provider_close()
 
 
 class OpenAIClient(_CachedOpenAIClient):
@@ -351,7 +427,7 @@ class OpenAIClient(_CachedOpenAIClient):
         )
         self._client = client_factory(
             api_key=api_key or os.getenv("OPENAI_API_KEY") or "EMPTY",
-            base_url=resolved_base_url,
+            base_url=self.base_url,
             timeout=timeout,
             max_retries=0,
         )
@@ -413,7 +489,7 @@ class AzureResponsesClient(_CachedOpenAIClient):
         )
         self._client = client_factory(
             api_key=api_key or os.getenv("OPENAI_API_KEY") or "EMPTY",
-            base_url=resolved_base_url,
+            base_url=self.base_url,
             default_query={"api-version": resolved_api_version},
             timeout=timeout,
             max_retries=0,
