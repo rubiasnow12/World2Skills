@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+from pathlib import Path
+import shutil
+
+import pytest
+import yaml
+
+from world2skills.runtime.skill_loader import load_skill, select_grounding
+
+
+REPO_SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"
+REQUIRED_HEADINGS = [
+    "## When to use",
+    "## Procedure",
+    "## Reasoning cues",
+    "## Failure modes & recovery",
+]
+EXPECTED_PRIMITIVES = {
+    "facilitate-highway-merge": [
+        "change-lane-left",
+        "maintain-speed",
+        "accelerate",
+        "decelerate",
+    ],
+    "follow-keep-distance": [
+        "maintain-speed",
+        "accelerate",
+        "decelerate",
+    ],
+    "lane-change-overtake": [
+        "change-lane-left",
+        "change-lane-right",
+        "maintain-speed",
+        "accelerate",
+        "decelerate",
+    ],
+    "roundabout-navigate": [
+        "maintain-speed",
+        "accelerate",
+        "decelerate",
+    ],
+    "unprotected-left-turn": [
+        "maintain-speed",
+        "accelerate",
+        "decelerate",
+    ],
+}
+
+
+def _copy_skill(
+    tmp_path: Path,
+    source_id: str = "lane-change-overtake",
+    destination_id: str | None = None,
+) -> tuple[Path, Path]:
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / (destination_id or source_id)
+    shutil.copytree(REPO_SKILLS_DIR / source_id, skill_dir)
+    return skills_dir, skill_dir
+
+
+@pytest.mark.parametrize("skill_id", sorted(EXPECTED_PRIMITIVES))
+def test_loads_all_skills_and_preserves_required_fields(skill_id: str):
+    card = load_skill(skill_id)
+    source = yaml.safe_load(
+        (REPO_SKILLS_DIR / skill_id / "skill.yaml").read_text(encoding="utf-8")
+    )
+
+    assert card.name == skill_id
+    assert card.description == source["description"]
+    for field_name in (
+        "parameters",
+        "interface",
+        "execution",
+        "preconditions",
+        "effects",
+        "success_criteria",
+        "failure_criteria",
+        "safety_constraints",
+        "failure_modes",
+        "termination",
+    ):
+        assert getattr(card, field_name) == source[field_name]
+    assert [asdict(grounding) for grounding in card.groundings] == source["groundings"]
+    assert card.primitives == EXPECTED_PRIMITIVES[skill_id]
+
+    headings = [
+        line for line in card.skill_md_body.splitlines() if line.startswith("## ")
+    ]
+    assert headings == REQUIRED_HEADINGS
+
+
+def test_selects_grounding_and_rejects_missing_backend():
+    card = load_skill("lane-change-overtake")
+
+    grounding = select_grounding(card)
+
+    assert grounding.backend == "highway-env"
+    assert grounding.backend_version == ">=1.8"
+    assert grounding.environment == "highway-v0"
+    assert grounding.primitive_map["accelerate"] == "FASTER"
+    with pytest.raises(ValueError, match="no grounding.*carla"):
+        select_grounding(card, backend="carla")
+
+
+@pytest.mark.parametrize("missing_name", ["SKILL.md", "skill.yaml"])
+def test_rejects_missing_required_file(tmp_path: Path, missing_name: str):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    (skill_dir / missing_name).unlink()
+
+    with pytest.raises(FileNotFoundError, match=missing_name):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+@pytest.mark.parametrize(
+    "skill_id",
+    [
+        "",
+        ".",
+        "..",
+        "../lane-change-overtake",
+        "lane-change-overtake/../follow-keep-distance",
+        "/tmp/lane-change-overtake",
+        "Lane-Change-Overtake",
+        "lane_change_overtake",
+    ],
+)
+def test_rejects_invalid_skill_id_and_path_traversal(skill_id: str):
+    with pytest.raises(ValueError, match="invalid skill id"):
+        load_skill(skill_id)
+
+
+def test_rejects_frontmatter_without_closing_fence(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    md_path = skill_dir / "SKILL.md"
+    md_path.write_text(
+        "---\n"
+        "name: lane-change-overtake\n"
+        "description: missing closing fence\n"
+        "# Lane Change Overtake\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="frontmatter"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_invalid_frontmatter_yaml(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    md_path = skill_dir / "SKILL.md"
+    md_path.write_text(
+        "---\nname: [\n---\n# Lane Change Overtake\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="frontmatter"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_non_mapping_frontmatter(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    md_path = skill_dir / "SKILL.md"
+    md_path.write_text(
+        "---\n- lane-change-overtake\n---\n# Lane Change Overtake\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="frontmatter.*mapping"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+@pytest.mark.parametrize(
+    ("source", "replacement"),
+    [
+        ("## When to use", "## When to use this skill"),
+        ("## Failure modes & recovery", "## Failure modes"),
+        ("## Procedure", "## Procedure\n\n## Extra section"),
+    ],
+)
+def test_rejects_missing_changed_or_extra_level_two_heading(
+    tmp_path: Path,
+    source: str,
+    replacement: str,
+):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    md_path = skill_dir / "SKILL.md"
+    md_path.write_text(
+        md_path.read_text(encoding="utf-8").replace(source, replacement),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="required headings"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_folder_name_mismatch(tmp_path: Path):
+    skills_dir, _ = _copy_skill(
+        tmp_path,
+        destination_id="renamed-lane-change-overtake",
+    )
+
+    with pytest.raises(ValueError, match="name mismatch"):
+        load_skill("renamed-lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_frontmatter_name_mismatch(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    md_path = skill_dir / "SKILL.md"
+    md_path.write_text(
+        md_path.read_text(encoding="utf-8").replace(
+            "name: lane-change-overtake",
+            "name: follow-keep-distance",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="name mismatch"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_yaml_name_mismatch(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    yaml_path = skill_dir / "skill.yaml"
+    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    data["name"] = "follow-keep-distance"
+    yaml_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="name mismatch"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_schema_invalid_skill_yaml(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    yaml_path = skill_dir / "skill.yaml"
+    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    del data["effects"]
+    yaml_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"skill\.yaml validation failed"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)

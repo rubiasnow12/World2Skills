@@ -29,9 +29,12 @@ class SkillCard:
     interface: dict[str, Any]
     execution: dict[str, Any]
     preconditions: list[str]
+    effects: list[str]
     success_criteria: list[str]
     failure_criteria: list[str]
     safety_constraints: list[str]
+    failure_modes: list[str]
+    termination: str
     groundings: list[Grounding]
     primitives: list[str]
 

@@ -27,9 +27,12 @@ def test_grounding_and_skill_card_json_contract():
         interface={"actions": []},
         execution={"entry": "check-lead"},
         preconditions=["a slower lead vehicle exists"],
+        effects=["ego is ahead of the blocking vehicle"],
         success_criteria=["ego overtook the lead vehicle"],
         failure_criteria=["collision == true"],
         safety_constraints=["lane change only into an existing lane"],
+        failure_modes=["changing into an occupied gap"],
+        termination="ego passed the lead vehicle",
         groundings=[grounding],
         primitives=["accelerate"],
     )
@@ -43,6 +46,9 @@ def test_grounding_and_skill_card_json_contract():
     assert skill_payload["safety_constraints"] == [
         "lane change only into an existing lane"
     ]
+    assert skill_payload["effects"] == ["ego is ahead of the blocking vehicle"]
+    assert skill_payload["failure_modes"] == ["changing into an occupied gap"]
+    assert skill_payload["termination"] == "ego passed the lead vehicle"
     assert skill_payload["groundings"][0]["backend_version"] == ">=1.8"
     json.dumps(grounding_payload)
     json.dumps(skill_payload)
