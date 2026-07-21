@@ -146,13 +146,22 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
         + result.unavailable_action_attempts
         + result.llm_errors
     )
-    if fallback_count > result.steps:
+    fallback_limit = result.steps + (result.status == "error")
+    if fallback_count > fallback_limit:
+        limit_name = (
+            "steps+1 for error episodes"
+            if result.status == "error"
+            else "steps"
+        )
         raise ValueError(
-            "fallback counter sum must not exceed steps"
+            f"fallback counter sum must not exceed {limit_name}"
         )
 
-    if result.status == "error" and result.success:
-        raise ValueError("error episode cannot report success")
+    if result.status == "error":
+        if result.success:
+            raise ValueError("error episode cannot report success")
+        return
+
     if result.success:
         _validate_success_contract(result)
     elif result.scenario_completed:

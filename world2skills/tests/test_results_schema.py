@@ -277,6 +277,67 @@ def test_aggregate_rejects_fallback_counter_overflow() -> None:
         _batch([episode])
 
 
+def test_error_episode_preserves_completed_causal_state_and_writes(
+    tmp_path: Path,
+) -> None:
+    episode = replace(
+        _episode(
+            7,
+            status="error",
+            exception_type="RuntimeError",
+            exception_message="post-step evaluation failed",
+        ),
+        scenario_completed=True,
+        lane_change_completed_step=3,
+        overtake_step=5,
+    )
+
+    batch = _batch([episode])
+    write_outputs(tmp_path, batch, [episode], config={})
+
+    payload = json.loads((tmp_path / "results.json").read_text())
+    stored = payload["results"][0]
+    assert stored["status"] == "error"
+    assert stored["success"] is False
+    assert stored["scenario_completed"] is True
+    assert stored["lane_change_completed_step"] == 3
+    assert stored["overtake_step"] == 5
+
+
+def test_error_episode_allows_one_prestep_fallback_and_writes(
+    tmp_path: Path,
+) -> None:
+    episode = replace(
+        _episode(
+            8,
+            status="error",
+            exception_type="RuntimeError",
+            exception_message="env.step failed",
+        ),
+        parse_failures=1,
+    )
+
+    batch = _batch([episode])
+    write_outputs(tmp_path, batch, [episode], config={})
+
+    payload = json.loads((tmp_path / "results.json").read_text())
+    stored = payload["results"][0]
+    assert stored["steps"] == 0
+    assert stored["parse_failures"] == 1
+    assert (tmp_path / "episode_8.jsonl").read_bytes() == b""
+
+
+def test_error_episode_rejects_more_than_one_prestep_fallback() -> None:
+    episode = replace(
+        _episode(0, status="error"),
+        parse_failures=1,
+        llm_errors=1,
+    )
+
+    with pytest.raises(ValueError, match=r"fallback.*steps\+1"):
+        _batch([episode])
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -354,7 +415,7 @@ def test_aggregate_rejects_contradictory_success_contract(
         _batch([episode])
 
 
-def test_aggregate_rejects_completed_unsuccessful_episode() -> None:
+def test_aggregate_rejects_completed_unsuccessful_ok_episode() -> None:
     episode = replace(
         _episode(0, success=False),
         scenario_completed=True,
