@@ -144,14 +144,10 @@ def _decision(
 
 class _FakeExecutor:
     def __init__(self, decisions: list[DecisionResult]) -> None:
-        self.grounding = SimpleNamespace(
-            observation={"features": _FEATURES.copy()}
-        )
+        self.grounding = SimpleNamespace(observation={"features": _FEATURES.copy()})
         self._decisions = decisions
         self._index = 0
-        self.decide_calls: list[
-            tuple[str, ObservationContext, list[str]]
-        ] = []
+        self.decide_calls: list[tuple[str, ObservationContext, list[str]]] = []
 
     def available_primitives(self, env: Any) -> list[str]:
         del env
@@ -164,12 +160,8 @@ class _FakeExecutor:
         available_primitives: list[str],
     ) -> DecisionResult:
         assert context.available_primitives == available_primitives
-        self.decide_calls.append(
-            (obs_text, context, available_primitives.copy())
-        )
-        decision = self._decisions[
-            min(self._index, len(self._decisions) - 1)
-        ]
+        self.decide_calls.append((obs_text, context, available_primitives.copy()))
+        decision = self._decisions[min(self._index, len(self._decisions) - 1)]
         self._index += 1
         return decision
 
@@ -177,9 +169,7 @@ class _FakeExecutor:
 class _FakeEnv:
     def __init__(
         self,
-        transitions: list[
-            tuple[np.ndarray, Any, Any, Any, Any]
-        ],
+        transitions: list[tuple[np.ndarray, Any, Any, Any, Any]],
         *,
         close_error: Exception | None = None,
     ) -> None:
@@ -187,9 +177,7 @@ class _FakeEnv:
         self._index = 0
         self.close_error = close_error
         self.close_calls = 0
-        self.unwrapped = SimpleNamespace(
-            vehicle=SimpleNamespace(crashed=False)
-        )
+        self.unwrapped = SimpleNamespace(vehicle=SimpleNamespace(crashed=False))
 
     def step(
         self,
@@ -272,11 +260,7 @@ class _FakeScenario:
         self.evaluate_calls += 1
         if self.evaluate_result is not _DEFAULT_SCENARIO_RESULT:
             return self.evaluate_result
-        return (
-            (True, "scripted success")
-            if self._success
-            else (False, "not complete")
-        )
+        return (True, "scripted success") if self._success else (False, "not complete")
 
 
 def _transition(
@@ -533,9 +517,7 @@ def test_invalid_reward_preserves_step_without_counting_return(
 
     assert result.status == "error"
     assert result.exception_type == "ValueError"
-    assert result.exception_message == (
-        "env.step reward must be a finite real number"
-    )
+    assert result.exception_message == ("env.step reward must be a finite real number")
     assert result.episode_return == 0.0
     assert result.mean_speed == pytest.approx(18.0)
     assert result.terminated is True
@@ -839,9 +821,7 @@ def test_invalid_arguments_preserve_primary_error_when_close_fails() -> None:
             max_steps=1,
         )
 
-    assert caught.value.__notes__ == [
-        "cleanup_error: _CloseError: close failed"
-    ]
+    assert caught.value.__notes__ == ["cleanup_error: _CloseError: close failed"]
     assert env.close_calls == 1
 
 

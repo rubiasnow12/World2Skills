@@ -96,9 +96,9 @@ def test_valid_json_primitive_maps_to_backend_index():
 
 
 def test_exact_json_fence_is_accepted():
-    result = _executor(
-        '```json\n{"primitive": "decelerate"}\n```'
-    ).decide("observation", None, ALL_PRIMITIVES)
+    result = _executor('```json\n{"primitive": "decelerate"}\n```').decide(
+        "observation", None, ALL_PRIMITIVES
+    )
 
     assert result.primitive == "decelerate"
     assert result.action_index == 4
@@ -261,16 +261,11 @@ def test_prompt_contains_full_skill_contract_and_filtered_allowed_list():
     assert "ego past the lead vehicle at target speed OR overtake aborted" in user
     assert "# Current observation" in user
     assert "Ego: lane=1 speed=20.0 m/s" in user
-    assert (
-        '# Allowed primitives this step\n["accelerate", "decelerate"]'
-        in user
-    )
+    assert '# Allowed primitives this step\n["accelerate", "decelerate"]' in user
 
 
 def test_build_messages_accepts_approved_observation_context_interface():
-    context = _observation_context(
-        ["teleport", "decelerate", "accelerate"]
-    )
+    context = _observation_context(["teleport", "decelerate", "accelerate"])
 
     messages = _executor().build_messages("observation", context)
 
@@ -323,9 +318,7 @@ def test_decide_rejects_context_availability_mismatch_before_llm_call():
     ("mutator", "message"),
     [
         (
-            lambda primitive_map, name_to_index: primitive_map.pop(
-                "change-lane-left"
-            ),
+            lambda primitive_map, name_to_index: primitive_map.pop("change-lane-left"),
             "primitive_map is missing skill primitives",
         ),
         (
@@ -333,27 +326,19 @@ def test_decide_rejects_context_availability_mismatch_before_llm_call():
             "backend actions missing from name_to_index",
         ),
         (
-            lambda primitive_map, name_to_index: name_to_index.update(
-                {"SLOWER": 3}
-            ),
+            lambda primitive_map, name_to_index: name_to_index.update({"SLOWER": 3}),
             "duplicate action indices",
         ),
         (
-            lambda primitive_map, name_to_index: name_to_index.update(
-                {"FASTER": "3"}
-            ),
+            lambda primitive_map, name_to_index: name_to_index.update({"FASTER": "3"}),
             "action indices must be non-negative integers",
         ),
         (
-            lambda primitive_map, name_to_index: name_to_index.update(
-                {"FASTER": True}
-            ),
+            lambda primitive_map, name_to_index: name_to_index.update({"FASTER": True}),
             "action indices must be non-negative integers",
         ),
         (
-            lambda primitive_map, name_to_index: name_to_index.update(
-                {"FASTER": -1}
-            ),
+            lambda primitive_map, name_to_index: name_to_index.update({"FASTER": -1}),
             "action indices must be non-negative integers",
         ),
     ],
@@ -631,9 +616,7 @@ class FakeActionType:
 
 
 def test_available_primitives_maps_env_indices_in_skill_order():
-    env = SimpleNamespace(
-        unwrapped=SimpleNamespace(action_type=FakeActionType())
-    )
+    env = SimpleNamespace(unwrapped=SimpleNamespace(action_type=FakeActionType()))
 
     available = _executor().available_primitives(env)
 

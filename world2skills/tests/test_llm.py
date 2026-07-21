@@ -304,9 +304,7 @@ def test_provider_receives_canonical_base_url_and_endpoint_fields_are_read_only(
 
 
 def test_azure_responses_sends_effective_settings_and_endpoint_identity():
-    provider = FakeOpenAIProvider(
-        response_outcomes=[_responses_response("accelerate")]
-    )
+    provider = FakeOpenAIProvider(response_outcomes=[_responses_response("accelerate")])
     factory = RecordingFactory(provider)
     client = AzureResponsesClient(
         model="gpt-5.4",
@@ -723,9 +721,7 @@ def test_lock_lease_covers_timeout_retry_and_safety_budget():
 
     assert client.request_timeout == 2.0
     assert client.lock_safety_margin == 3.0
-    assert client.lock_lease_seconds == pytest.approx(
-        3 * 2.0 + 1.0 + 4.0 + 3.0
-    )
+    assert client.lock_lease_seconds == pytest.approx(3 * 2.0 + 1.0 + 4.0 + 3.0)
     client.close()
 
 

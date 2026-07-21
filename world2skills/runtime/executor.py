@@ -70,32 +70,19 @@ class LLMSkillExecutor:
             )
 
         backend_actions = [
-            self._primitive_map[primitive]
-            for primitive in self._primitives
+            self._primitive_map[primitive] for primitive in self._primitives
         ]
-        if any(
-            not isinstance(name, str) or not name
-            for name in backend_actions
-        ):
-            raise ValueError(
-                "primitive_map backend actions must be non-empty strings"
-            )
+        if any(not isinstance(name, str) or not name for name in backend_actions):
+            raise ValueError("primitive_map backend actions must be non-empty strings")
 
-        if any(
-            not isinstance(name, str) or not name
-            for name in self._name_to_index
-        ):
+        if any(not isinstance(name, str) or not name for name in self._name_to_index):
             raise ValueError("backend action names must be non-empty strings")
         indices = list(self._name_to_index.values())
         if any(
-            isinstance(index, bool)
-            or not isinstance(index, int)
-            or index < 0
+            isinstance(index, bool) or not isinstance(index, int) or index < 0
             for index in indices
         ):
-            raise ValueError(
-                "action indices must be non-negative integers"
-            )
+            raise ValueError("action indices must be non-negative integers")
         if len(set(indices)) != len(indices):
             raise ValueError("duplicate action indices are not allowed")
 
@@ -119,11 +106,7 @@ class LLMSkillExecutor:
             for primitive in available_primitives or ()
             if isinstance(primitive, str)
         }
-        return [
-            primitive
-            for primitive in self._primitives
-            if primitive in supplied
-        ]
+        return [primitive for primitive in self._primitives if primitive in supplied]
 
     def _require_available(
         self,
@@ -131,9 +114,7 @@ class LLMSkillExecutor:
     ) -> list[str]:
         allowed = self._filter_available(available_primitives)
         if not allowed:
-            raise NoAvailablePrimitiveError(
-                "no skill primitive is currently available"
-            )
+            raise NoAvailablePrimitiveError("no skill primitive is currently available")
         return allowed
 
     def build_messages(
@@ -150,9 +131,7 @@ class LLMSkillExecutor:
         )
         allowed = self._require_available(available_primitives)
         card = self.skill_card
-        safety = "\n".join(
-            f"- {constraint}" for constraint in card.safety_constraints
-        )
+        safety = "\n".join(f"- {constraint}" for constraint in card.safety_constraints)
         system = (
             "You are an autonomous-driving policy. Choose exactly one abstract "
             "driving primitive for the current step.\n"
@@ -168,22 +147,14 @@ class LLMSkillExecutor:
             [
                 f"# Skill: {card.name}\n{card.description}",
                 f"# Skill instructions\n{card.skill_md_body.rstrip()}",
-                "# Parameters\n"
-                + _json_block(card.parameters),
-                "# Preconditions\n"
-                + _list_block(card.preconditions),
-                "# Execution graph\n"
-                + _json_block(card.execution),
-                "# Effects\n"
-                + _list_block(card.effects),
-                "# Success criteria\n"
-                + _list_block(card.success_criteria),
-                "# Failure criteria\n"
-                + _list_block(card.failure_criteria),
-                "# Safety constraints\n"
-                + _list_block(card.safety_constraints),
-                "# Failure modes\n"
-                + _list_block(card.failure_modes),
+                "# Parameters\n" + _json_block(card.parameters),
+                "# Preconditions\n" + _list_block(card.preconditions),
+                "# Execution graph\n" + _json_block(card.execution),
+                "# Effects\n" + _list_block(card.effects),
+                "# Success criteria\n" + _list_block(card.success_criteria),
+                "# Failure criteria\n" + _list_block(card.failure_criteria),
+                "# Safety constraints\n" + _list_block(card.safety_constraints),
+                "# Failure modes\n" + _list_block(card.failure_modes),
                 f"# Termination\n{card.termination}",
                 f"# Current observation\n{obs_text}",
                 "# Allowed primitives this step\n"
@@ -235,18 +206,13 @@ class LLMSkillExecutor:
 
         allowed = self._filter_available(available_primitives)
         if context is not None:
-            context_allowed = self._filter_available(
-                context.available_primitives
-            )
+            context_allowed = self._filter_available(context.available_primitives)
             if context_allowed != allowed:
                 raise ValueError(
-                    "context available_primitives do not match explicit "
-                    "availability"
+                    "context available_primitives do not match explicit availability"
                 )
         if not allowed:
-            raise NoAvailablePrimitiveError(
-                "no skill primitive is currently available"
-            )
+            raise NoAvailablePrimitiveError("no skill primitive is currently available")
         messages = self.build_messages(obs_text, allowed)
         settings = ModelSettings()
         status = "ok"
@@ -296,9 +262,7 @@ class LLMSkillExecutor:
                 primitive = self._fallback(allowed)
             elif primitive not in allowed:
                 status = "unavailable_fallback"
-                fallback_reason = (
-                    f"{primitive} is not available in the current state"
-                )
+                fallback_reason = f"{primitive} is not available in the current state"
                 primitive = self._fallback(allowed)
         else:
             primitive = self._fallback(allowed)
@@ -320,14 +284,11 @@ class LLMSkillExecutor:
     def available_primitives(self, env: Any) -> list[str]:
         """Return environment-available primitives in stable skill order."""
 
-        available_indices = set(
-            env.unwrapped.action_type.get_available_actions()
-        )
+        available_indices = set(env.unwrapped.action_type.get_available_actions())
         return [
             primitive
             for primitive in self._primitives
-            if self._name_to_index[self._primitive_map[primitive]]
-            in available_indices
+            if self._name_to_index[self._primitive_map[primitive]] in available_indices
         ]
 
 

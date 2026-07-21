@@ -59,10 +59,7 @@ def _fallback_step(
 
 
 def _steps(count: int, *, reward: float = 0.0) -> list[StepRecord]:
-    return [
-        replace(_step(reward=reward), t=index)
-        for index in range(count)
-    ]
+    return [replace(_step(reward=reward), t=index) for index in range(count)]
 
 
 def _episode(
@@ -87,18 +84,12 @@ def _episode(
                 )
             )
     resolved_return = (
-        math.fsum(
-            record.reward
-            for record in records
-            if record.reward is not None
-        )
+        math.fsum(record.reward for record in records if record.reward is not None)
         if episode_return is None
         else episode_return
     )
     resolved_crashed = (
-        any(record.crashed for record in records)
-        if crashed is None
-        else crashed
+        any(record.crashed for record in records) if crashed is None else crashed
     )
     return EpisodeResult(
         seed=seed,
@@ -760,14 +751,12 @@ def test_write_outputs_writes_strict_summaries_and_full_traces(
     assert config_bytes.endswith(b"\n")
     assert results_payload["seeds"] == [0, 2]
     assert [item["seed"] for item in results_payload["results"]] == [0, 2]
-    assert all(
-        "step_records" not in item for item in results_payload["results"]
-    )
+    assert all("step_records" not in item for item in results_payload["results"])
     assert json.loads(config_bytes) == config
 
-    trace_lines = (tmp_path / "episode_0.jsonl").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    trace_lines = (
+        (tmp_path / "episode_0.jsonl").read_text(encoding="utf-8").splitlines()
+    )
     assert len(trace_lines) == 2
     trace = json.loads(trace_lines[0])
     assert trace == asdict(results[1].step_records[0])
@@ -887,18 +876,12 @@ def test_write_outputs_rejects_nonempty_run_dir_without_changes(
     out.mkdir()
     (out / "results.json").write_bytes(b"old-results\n")
     (out / "sentinel.bin").write_bytes(b"\x00\x01old")
-    before = {
-        path.name: path.read_bytes()
-        for path in out.iterdir()
-    }
+    before = {path.name: path.read_bytes() for path in out.iterdir()}
 
     with pytest.raises(ValueError, match="non-empty"):
         write_outputs(out, _batch(results), results, config={})
 
-    after = {
-        path.name: path.read_bytes()
-        for path in out.iterdir()
-    }
+    after = {path.name: path.read_bytes() for path in out.iterdir()}
     assert after == before
     assert list(tmp_path.glob(".run.staging-*")) == []
 

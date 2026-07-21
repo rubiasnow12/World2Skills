@@ -52,9 +52,7 @@ def _validated_reward(value: object) -> float:
         or not isinstance(value, Real)
         or not math.isfinite(value)
     ):
-        raise ValueError(
-            "env.step reward must be a finite real number"
-        )
+        raise ValueError("env.step reward must be a finite real number")
     return float(value)
 
 
@@ -69,11 +67,7 @@ def _best_effort_env_crashed(env: Any) -> bool:
         value = getattr(env.unwrapped.vehicle, "crashed", False)
     except Exception:
         return False
-    return (
-        bool(value)
-        if isinstance(value, (bool, np.bool_))
-        else False
-    )
+    return bool(value) if isinstance(value, (bool, np.bool_)) else False
 
 
 def _validated_scenario_result(
@@ -81,14 +75,10 @@ def _validated_scenario_result(
     source: str,
 ) -> tuple[bool, str]:
     if type(value) is not tuple or len(value) != 2:
-        raise TypeError(
-            f"{source} must return an exact 2-tuple (bool, str)"
-        )
+        raise TypeError(f"{source} must return an exact 2-tuple (bool, str)")
     outcome, reason = value
     if type(outcome) is not bool or type(reason) is not str:
-        raise TypeError(
-            f"{source} must return an exact 2-tuple (bool, str)"
-        )
+        raise TypeError(f"{source} must return an exact 2-tuple (bool, str)")
     return outcome, reason
 
 
@@ -287,9 +277,7 @@ def _run_episode(
 
             if not isinstance(info, Mapping):
                 if validation_error is None:
-                    validation_error = TypeError(
-                        "env.step info must be a mapping"
-                    )
+                    validation_error = TypeError("env.step info must be a mapping")
             else:
                 if "crashed" in info:
                     try:
@@ -316,9 +304,7 @@ def _run_episode(
                 scenario.is_terminal(env),
                 "scenario.is_terminal",
             )
-            scenario_completed = scenario_completed or bool(
-                transition_success
-            )
+            scenario_completed = scenario_completed or bool(transition_success)
             termination_reason = _termination_reason(
                 scenario_completed=scenario_completed,
                 terminated=bool(terminated),
@@ -336,9 +322,7 @@ def _run_episode(
             "scenario.evaluate",
         )
         if scenario_completed != success:
-            raise ValueError(
-                "scenario completion disagrees with final success"
-            )
+            raise ValueError("scenario completion disagrees with final success")
         return _episode_result(
             seed=seed,
             status="ok",

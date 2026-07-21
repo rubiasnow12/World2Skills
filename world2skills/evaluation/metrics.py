@@ -28,8 +28,7 @@ class ArtifactPublicationError(RuntimeError):
         self.published = published
         state = "published" if published else "not published"
         super().__init__(
-            f"artifact publication durability failed for "
-            f"{self.path} ({state})"
+            f"artifact publication durability failed for {self.path} ({state})"
         )
 
 
@@ -109,9 +108,7 @@ def _ordered_results(
 
     result_seeds = [result.seed for result in results]
     if any(type(seed) is not int or seed < 0 for seed in result_seeds):
-        raise ValueError(
-            "result seeds must be nonnegative integers"
-        )
+        raise ValueError("result seeds must be nonnegative integers")
     if len(set(result_seeds)) != len(result_seeds):
         raise ValueError("results contain duplicate seeds")
 
@@ -128,9 +125,7 @@ def _ordered_results(
     ordered = [by_seed[seed] for seed in seeds]
     for result in ordered:
         if result.status not in _VALID_STATUSES:
-            raise ValueError(
-                "episode status must be exactly 'ok' or 'error'"
-            )
+            raise ValueError("episode status must be exactly 'ok' or 'error'")
         _validate_episode_summary(result)
     return ordered
 
@@ -143,20 +138,14 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
     for field_name in _NONNEGATIVE_INTEGER_FIELDS:
         value = getattr(result, field_name)
         if type(value) is not int or value < 0:
-            raise ValueError(
-                f"{field_name} must be a nonnegative integer"
-            )
+            raise ValueError(f"{field_name} must be a nonnegative integer")
 
     for field_name in _OPTIONAL_NONNEGATIVE_INTEGER_FIELDS:
         value = getattr(result, field_name)
         if value is not None and (type(value) is not int or value < 0):
-            raise ValueError(
-                f"{field_name} must be a nonnegative integer or None"
-            )
+            raise ValueError(f"{field_name} must be a nonnegative integer or None")
         if value is not None and value >= result.steps:
-            raise ValueError(
-                f"{field_name} must be less than steps"
-            )
+            raise ValueError(f"{field_name} must be less than steps")
 
     if result.steps != len(result.step_records):
         raise ValueError("steps must equal len(step_records)")
@@ -175,13 +164,8 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
 
     if result.mean_speed < 0:
         raise ValueError("mean_speed must be finite and nonnegative")
-    if (
-        result.lead_initial_gap_m is not None
-        and result.lead_initial_gap_m <= 0
-    ):
-        raise ValueError(
-            "lead_initial_gap_m must be finite and positive"
-        )
+    if result.lead_initial_gap_m is not None and result.lead_initial_gap_m <= 0:
+        raise ValueError("lead_initial_gap_m must be finite and positive")
 
     if not math.isclose(
         result.episode_return,
@@ -189,29 +173,19 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
         rel_tol=_RETURN_REL_TOLERANCE,
         abs_tol=_RETURN_ABS_TOLERANCE,
     ):
-        raise ValueError(
-            "episode_return must equal the sum of recorded rewards"
-        )
+        raise ValueError("episode_return must equal the sum of recorded rewards")
     if result.crashed != trace_crashed:
-        raise ValueError(
-            "crashed must equal any(record.crashed) in step_records"
-        )
+        raise ValueError("crashed must equal any(record.crashed) in step_records")
 
     fallback_count = (
-        result.parse_failures
-        + result.unavailable_action_attempts
-        + result.llm_errors
+        result.parse_failures + result.unavailable_action_attempts + result.llm_errors
     )
     fallback_limit = result.steps + (result.status == "error")
     if fallback_count > fallback_limit:
         limit_name = (
-            "steps+1 for error episodes"
-            if result.status == "error"
-            else "steps"
+            "steps+1 for error episodes" if result.status == "error" else "steps"
         )
-        raise ValueError(
-            f"fallback counter sum must not exceed {limit_name}"
-        )
+        raise ValueError(f"fallback counter sum must not exceed {limit_name}")
     _validate_fallback_counters(result, trace_counts)
 
     if result.status == "error":
@@ -222,9 +196,7 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
     if result.success:
         _validate_success_contract(result)
     elif result.scenario_completed:
-        raise ValueError(
-            "scenario_completed=True requires success=True"
-        )
+        raise ValueError("scenario_completed=True requires success=True")
 
 
 def _validate_success_contract(result: EpisodeResult) -> None:
@@ -233,31 +205,15 @@ def _validate_success_contract(result: EpisodeResult) -> None:
     if result.crashed:
         raise ValueError("success=True requires crashed=False")
     if not result.scenario_completed:
-        raise ValueError(
-            "success=True requires scenario_completed=True"
-        )
+        raise ValueError("success=True requires scenario_completed=True")
     if not result.target_initially_ahead:
-        raise ValueError(
-            "success=True requires target_initially_ahead=True"
-        )
-    if (
-        result.lane_change_completed_step is None
-        or result.overtake_step is None
-    ):
-        raise ValueError(
-            "success=True requires non-None causal steps"
-        )
+        raise ValueError("success=True requires target_initially_ahead=True")
+    if result.lane_change_completed_step is None or result.overtake_step is None:
+        raise ValueError("success=True requires non-None causal steps")
     if result.lane_change_completed_step >= result.overtake_step:
-        raise ValueError(
-            "lane_change_completed_step must precede overtake_step"
-        )
-    if (
-        not isinstance(result.success_reason, str)
-        or not result.success_reason.strip()
-    ):
-        raise ValueError(
-            "success=True requires a non-empty success_reason"
-        )
+        raise ValueError("lane_change_completed_step must precede overtake_step")
+    if not isinstance(result.success_reason, str) or not result.success_reason.strip():
+        raise ValueError("success=True requires a non-empty success_reason")
 
 
 def _validate_step_records(
@@ -277,9 +233,7 @@ def _validate_step_records(
         if not isinstance(record, StepRecord):
             raise ValueError(f"{prefix} must be a StepRecord")
         if type(record.t) is not int or record.t != index:
-            raise ValueError(
-                f"{prefix}.t must equal its sequential list index"
-            )
+            raise ValueError(f"{prefix}.t must equal its sequential list index")
         _validate_nonempty_string(
             record.obs_summary,
             f"{prefix}.obs_summary",
@@ -290,9 +244,7 @@ def _validate_step_records(
             f"{prefix}.backend_action",
         )
         if type(record.action_index) is not int or record.action_index < 0:
-            raise ValueError(
-                f"{prefix}.action_index must be a nonnegative integer"
-            )
+            raise ValueError(f"{prefix}.action_index must be a nonnegative integer")
         if record.reward is None:
             if status != "error" or index != len(records) - 1:
                 raise ValueError(
@@ -325,9 +277,7 @@ def _validate_step_records(
             not isinstance(record.decision_status, str)
             or record.decision_status not in _VALID_DECISION_STATUSES
         ):
-            raise ValueError(
-                f"{prefix}.decision_status is invalid"
-            )
+            raise ValueError(f"{prefix}.decision_status is invalid")
         if record.decision_status == "ok":
             if record.fallback_reason is not None:
                 raise ValueError(
@@ -352,20 +302,16 @@ def _validate_step_records(
             or len(set(primitives)) != len(primitives)
         ):
             raise ValueError(
-                f"{prefix}.available_primitives must be unique "
-                "non-empty strings"
+                f"{prefix}.available_primitives must be unique non-empty strings"
             )
         if record.primitive not in primitives:
             raise ValueError(
-                f"{prefix}.available_primitives must contain "
-                "the chosen primitive"
+                f"{prefix}.available_primitives must contain the chosen primitive"
             )
     try:
         episode_return = math.fsum(rewards)
     except OverflowError as exc:
-        raise ValueError(
-            "recorded rewards must have a finite sum"
-        ) from exc
+        raise ValueError("recorded rewards must have a finite sum") from exc
     return counts, episode_return, crashed
 
 
@@ -377,13 +323,10 @@ def _validate_fallback_counters(
     for field_name, trace_count in trace_counts.items():
         summary_count = getattr(result, field_name)
         if trace_count > summary_count:
-            raise ValueError(
-                f"{field_name} trace count exceeds episode summary"
-            )
+            raise ValueError(f"{field_name} trace count exceeds episode summary")
         if result.status == "ok" and trace_count != summary_count:
             raise ValueError(
-                f"{field_name} must exactly match trace count "
-                "for ok episodes"
+                f"{field_name} must exactly match trace count for ok episodes"
             )
         untraced_total += summary_count - trace_count
 
@@ -412,9 +355,7 @@ def _validate_step_number(
         or (nonnegative and value < 0)
     ):
         qualifier = "finite nonnegative" if nonnegative else "finite"
-        raise ValueError(
-            f"{field_name} must be a {qualifier} Real for strict JSON"
-        )
+        raise ValueError(f"{field_name} must be a {qualifier} Real for strict JSON")
 
 
 def _validate_finite_number(value: object, field_name: str) -> None:
@@ -470,22 +411,12 @@ def aggregate(
     completed = sum(result.status == "ok" for result in ordered)
     errors = sum(result.status == "error" for result in ordered)
     if completed + errors != requested:
-        raise ValueError(
-            "completed and error episodes must equal requested episodes"
-        )
+        raise ValueError("completed and error episodes must equal requested episodes")
 
-    successful = sum(
-        result.status == "ok" and result.success for result in ordered
-    )
+    successful = sum(result.status == "ok" and result.success for result in ordered)
     collisions = sum(result.crashed for result in ordered)
-    ok_returns = [
-        result.episode_return
-        for result in ordered
-        if result.status == "ok"
-    ]
-    mean_return = (
-        math.fsum(ok_returns) / len(ok_returns) if ok_returns else 0.0
-    )
+    ok_returns = [result.episode_return for result in ordered if result.status == "ok"]
+    mean_return = math.fsum(ok_returns) / len(ok_returns) if ok_returns else 0.0
     if not math.isfinite(mean_return):
         raise ValueError("mean_return must be finite")
 
@@ -557,9 +488,7 @@ def _require_absent_or_empty_directory(path: Path) -> bool:
     if path.is_symlink() or not path.is_dir():
         raise ValueError("output path must be absent or an empty directory")
     if next(path.iterdir(), None) is not None:
-        raise ValueError(
-            "output run directory is non-empty; expected empty or absent"
-        )
+        raise ValueError("output run directory is non-empty; expected empty or absent")
     return True
 
 
@@ -598,12 +527,8 @@ def write_outputs(
     if type(config) is not dict:
         raise TypeError("config must be a dict")
 
-    results_text = (
-        _strict_json(asdict(batch), label="results.json", indent=2) + "\n"
-    )
-    config_text = (
-        _strict_json(config, label="config.json", indent=2) + "\n"
-    )
+    results_text = _strict_json(asdict(batch), label="results.json", indent=2) + "\n"
+    config_text = _strict_json(config, label="config.json", indent=2) + "\n"
     trace_texts: dict[int, str] = {}
     for result in ordered:
         lines = [

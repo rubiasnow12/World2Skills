@@ -40,7 +40,9 @@ def _validate_skill_id(skill_id: str) -> None:
 def _read_required_file(skill_dir: Path, filename: str) -> str:
     path = skill_dir / filename
     if not path.is_file():
-        raise FileNotFoundError(f"{filename} not found for '{skill_dir.name}' at {path}")
+        raise FileNotFoundError(
+            f"{filename} not found for '{skill_dir.name}' at {path}"
+        )
     return path.read_text(encoding="utf-8")
 
 
@@ -73,13 +75,13 @@ def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
         raise ValueError("SKILL.md frontmatter must be a mapping")
 
     field_nodes = {
-        key_node.value: value_node
-        for key_node, value_node in frontmatter_node.value
+        key_node.value: value_node for key_node, value_node in frontmatter_node.value
     }
     field_names = [key_node.value for key_node, _ in frontmatter_node.value]
-    if len(field_names) != len(_FRONTMATTER_FIELDS) or set(
-        field_names
-    ) != _FRONTMATTER_FIELDS:
+    if (
+        len(field_names) != len(_FRONTMATTER_FIELDS)
+        or set(field_names) != _FRONTMATTER_FIELDS
+    ):
         raise ValueError(
             "SKILL.md frontmatter fields must be exactly: "
             + ", ".join(sorted(_FRONTMATTER_FIELDS))
@@ -109,9 +111,7 @@ def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
             "SKILL.md frontmatter metadata must be a mapping with exactly "
             "schema_version and representation"
         )
-    metadata_field_names = [
-        key_node.value for key_node, _ in metadata_node.value
-    ]
+    metadata_field_names = [key_node.value for key_node, _ in metadata_node.value]
     if (
         len(metadata_field_names) != len(_METADATA_FIELDS)
         or set(metadata_field_names) != _METADATA_FIELDS
@@ -194,9 +194,7 @@ def _load_skill_yaml(text: str) -> dict[str, Any]:
     if errors:
         error = errors[0]
         location = "/".join(str(part) for part in error.absolute_path) or "<root>"
-        raise ValueError(
-            f"skill.yaml validation failed at {location}: {error.message}"
-        )
+        raise ValueError(f"skill.yaml validation failed at {location}: {error.message}")
     return data
 
 
@@ -286,6 +284,4 @@ def select_grounding(
     for grounding in card.groundings:
         if grounding.backend == backend:
             return grounding
-    raise ValueError(
-        f"skill '{card.name}' has no grounding for backend '{backend}'"
-    )
+    raise ValueError(f"skill '{card.name}' has no grounding for backend '{backend}'")

@@ -284,15 +284,9 @@ class _CachedOpenAIClient(LLMClient):
         self._lock_safety_margin = float(lock_safety_margin)
         if not math.isfinite(self._request_timeout) or self._request_timeout <= 0:
             raise ValueError("request_timeout must be finite and positive")
-        if any(
-            not math.isfinite(delay) or delay < 0
-            for delay in self.retry_delays
-        ):
+        if any(not math.isfinite(delay) or delay < 0 for delay in self.retry_delays):
             raise ValueError("retry delays must be finite and non-negative")
-        if (
-            not math.isfinite(self._lock_safety_margin)
-            or self._lock_safety_margin <= 0
-        ):
+        if not math.isfinite(self._lock_safety_margin) or self._lock_safety_margin <= 0:
             raise ValueError("lock_safety_margin must be finite and positive")
         attempt_count = len(self.retry_delays) + 1
         self._lock_lease_seconds = (
@@ -305,8 +299,7 @@ class _CachedOpenAIClient(LLMClient):
         self._cache: Cache | None = None
         if use_cache:
             cache_dir = Path(
-                cache_path
-                or Path.home() / ".cache" / "world2skills" / "llm"
+                cache_path or Path.home() / ".cache" / "world2skills" / "llm"
             ).expanduser()
             cache_dir.mkdir(parents=True, exist_ok=True)
             self._cache = Cache(str(cache_dir), eviction_policy="none")
@@ -352,10 +345,7 @@ class _CachedOpenAIClient(LLMClient):
             return True
         if isinstance(error, APIStatusError):
             status_code = error.status_code
-            return (
-                status_code in {408, 409, 429}
-                or 500 <= status_code <= 599
-            )
+            return status_code in {408, 409, 429} or 500 <= status_code <= 599
         return False
 
     def _call_with_retry(
@@ -501,9 +491,7 @@ class OpenAIClient(_CachedOpenAIClient):
         client_factory: Callable[..., Any] = OpenAI,
     ):
         resolved_base_url = (
-            base_url
-            or os.getenv("OPENAI_BASE_URL")
-            or DEFAULT_OPENAI_BASE_URL
+            base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_OPENAI_BASE_URL
         )
         super().__init__(
             model=model,
@@ -561,14 +549,10 @@ class AzureResponsesClient(_CachedOpenAIClient):
         client_factory: Callable[..., Any] = OpenAI,
     ):
         resolved_base_url = (
-            base_url
-            or os.getenv("OPENAI_BASE_URL")
-            or DEFAULT_AZURE_PROXY_URL
+            base_url or os.getenv("OPENAI_BASE_URL") or DEFAULT_AZURE_PROXY_URL
         )
         resolved_api_version = (
-            api_version
-            or os.getenv("OPENAI_API_VERSION")
-            or DEFAULT_AZURE_API_VERSION
+            api_version or os.getenv("OPENAI_API_VERSION") or DEFAULT_AZURE_API_VERSION
         )
         super().__init__(
             model=model,

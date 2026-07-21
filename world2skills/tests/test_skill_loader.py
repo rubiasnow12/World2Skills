@@ -335,8 +335,7 @@ def test_ignores_level_two_headings_inside_fenced_code_blocks(
     md_path = skill_dir / "SKILL.md"
     text = md_path.read_text(encoding="utf-8").replace(
         "## Reasoning cues",
-        f"{opening_fence}\n## Not a real section\n{closing_fence}\n\n"
-        "## Reasoning cues",
+        f"{opening_fence}\n## Not a real section\n{closing_fence}\n\n## Reasoning cues",
         1,
     )
     md_path.write_text(text, encoding="utf-8")

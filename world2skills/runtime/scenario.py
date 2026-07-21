@@ -41,9 +41,7 @@ def judge_success(
 
 def _finite_number(value: object) -> bool:
     return (
-        isinstance(value, Real)
-        and not isinstance(value, bool)
-        and math.isfinite(value)
+        isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
     )
 
 
@@ -85,9 +83,7 @@ class LaneChangeOvertakeScenario:
         )
         from highway_env.vehicle.kinematics import Vehicle
 
-        self.minimum_spawn_clearance_m = (
-            self.min_lane_gap_m + float(Vehicle.LENGTH)
-        )
+        self.minimum_spawn_clearance_m = self.min_lane_gap_m + float(Vehicle.LENGTH)
         if self.spawn_gap < self.minimum_spawn_clearance_m:
             raise ValueError(
                 "spawn_gap must be at least "
@@ -170,12 +166,8 @@ class LaneChangeOvertakeScenario:
         return {
             "success_margin": self.success_margin,
             "lead_speed_ratio": self.lead_speed_ratio,
-            "target_lane_front_clearance_m": (
-                self.target_lane_front_clearance_m
-            ),
-            "target_lane_rear_clearance_m": (
-                self.target_lane_rear_clearance_m
-            ),
+            "target_lane_front_clearance_m": (self.target_lane_front_clearance_m),
+            "target_lane_rear_clearance_m": (self.target_lane_rear_clearance_m),
             "spawn_gap": self.spawn_gap,
             "min_lane_gap_m": self.min_lane_gap_m,
             "minimum_spawn_clearance_m": self.minimum_spawn_clearance_m,
@@ -233,9 +225,7 @@ class LaneChangeOvertakeScenario:
         reachable = [
             lane_index
             for lane_index in side_lanes
-            if u.road.network.get_lane(lane_index).is_reachable_from(
-                ego.position
-            )
+            if u.road.network.get_lane(lane_index).is_reachable_from(ego.position)
         ]
         if not reachable:
             raise ScenarioSetupError("no reachable adjacent target lane")
@@ -324,9 +314,7 @@ class LaneChangeOvertakeScenario:
         lane_indexes = road.network.all_side_lanes(self.initial_ego_lane)
         if len(lane_indexes) < 2:
             raise ScenarioSetupError("overtake scenario requires at least 2 lanes")
-        if self.target_lane not in road.network.side_lanes(
-            self.initial_ego_lane
-        ):
+        if self.target_lane not in road.network.side_lanes(self.initial_ego_lane):
             raise ScenarioSetupError("target lane is not adjacent to initial lane")
 
         lead = self.initial_lead_vehicle
@@ -344,9 +332,7 @@ class LaneChangeOvertakeScenario:
         if gap <= 0:
             raise ScenarioSetupError("bound lead vehicle must be ahead of ego")
         actual_minimum_spawn_clearance = (
-            self.min_lane_gap_m
-            + float(ego.LENGTH) / 2
-            + float(lead.LENGTH) / 2
+            self.min_lane_gap_m + float(ego.LENGTH) / 2 + float(lead.LENGTH) / 2
         )
         if gap < actual_minimum_spawn_clearance:
             raise ScenarioSetupError(
@@ -369,22 +355,15 @@ class LaneChangeOvertakeScenario:
             expected_lead_speed,
             abs_tol=1e-8,
         ):
-            raise ScenarioSetupError(
-                "bound lead is not at the configured slower speed"
-            )
+            raise ScenarioSetupError("bound lead is not at the configured slower speed")
         if float(lead.speed) >= self.target_speed_mps:
             raise ScenarioSetupError("bound lead vehicle must be slower than target")
 
         target_lane = road.network.get_lane(self.target_lane)
         if not target_lane.is_reachable_from(ego.position):
             raise ScenarioSetupError("target lane is not reachable from ego")
-        target_ego_longitudinal = float(
-            target_lane.local_coordinates(ego.position)[0]
-        )
-        corridor_start = (
-            target_ego_longitudinal
-            - self.target_lane_rear_clearance_m
-        )
+        target_ego_longitudinal = float(target_lane.local_coordinates(ego.position)[0])
+        corridor_start = target_ego_longitudinal - self.target_lane_rear_clearance_m
         corridor_end = (
             target_ego_longitudinal
             + self.spawn_gap
@@ -399,13 +378,8 @@ class LaneChangeOvertakeScenario:
                     target_lane.local_coordinates(vehicle.position)[0]
                 )
                 if corridor_start <= vehicle_longitudinal <= corridor_end:
-                    raise ScenarioSetupError(
-                        "target lane corridor is not clear"
-                    )
-            if (
-                self._lane_contains(self.reference_lane, vehicle)
-                and vehicle is not ego
-            ):
+                    raise ScenarioSetupError("target lane corridor is not clear")
+            if self._lane_contains(self.reference_lane, vehicle) and vehicle is not ego:
                 raise ScenarioSetupError(
                     "unexpected traffic remains in the initial lane"
                 )
@@ -431,9 +405,7 @@ class LaneChangeOvertakeScenario:
 
         if self.overtake_step is None:
             ego_longitudinal = self._longitudinal(ego.position)
-            lead_longitudinal = self._longitudinal(
-                self.initial_lead_vehicle.position
-            )
+            lead_longitudinal = self._longitudinal(self.initial_lead_vehicle.position)
             if ego_longitudinal - lead_longitudinal >= self.success_margin:
                 self.overtake_step = t
 
@@ -489,9 +461,7 @@ class LaneChangeOvertakeScenario:
             else None
         )
         rear_closing_speed = (
-            float(rear.speed) - float(ego.speed)
-            if rear is not None
-            else None
+            float(rear.speed) - float(ego.speed) if rear is not None else None
         )
         return front_gap, rear_gap, rear_closing_speed
 
@@ -503,9 +473,7 @@ class LaneChangeOvertakeScenario:
             not isinstance(primitive, str) or not primitive.strip()
             for primitive in available_primitives
         ):
-            raise ValueError(
-                "available_primitives must be a list of non-empty strings"
-            )
+            raise ValueError("available_primitives must be a list of non-empty strings")
         if len(set(available_primitives)) != len(available_primitives):
             raise ValueError("available_primitives must be unique")
         return available_primitives.copy()
@@ -528,21 +496,11 @@ class LaneChangeOvertakeScenario:
         lane_indexes = u.road.network.all_side_lanes(ego.lane_index)
         lane_ids = {lane_index[2] for lane_index in lane_indexes}
         start, end, lane_id = ego.lane_index
-        left_lane = (
-            (start, end, lane_id - 1)
-            if lane_id - 1 in lane_ids
-            else None
-        )
-        right_lane = (
-            (start, end, lane_id + 1)
-            if lane_id + 1 in lane_ids
-            else None
-        )
+        left_lane = (start, end, lane_id - 1) if lane_id - 1 in lane_ids else None
+        right_lane = (start, end, lane_id + 1) if lane_id + 1 in lane_ids else None
 
         ego_longitudinal = self._longitudinal(ego.position)
-        lead_longitudinal = self._longitudinal(
-            self.initial_lead_vehicle.position
-        )
+        lead_longitudinal = self._longitudinal(self.initial_lead_vehicle.position)
         target_delta = lead_longitudinal - ego_longitudinal
         left_front, left_rear, left_closing = self._side_gap(
             env,
@@ -553,9 +511,7 @@ class LaneChangeOvertakeScenario:
             right_lane,
         )
         return ObservationContext(
-            available_primitives=self._context_primitives(
-                available_primitives
-            ),
+            available_primitives=self._context_primitives(available_primitives),
             ego_lane=int(lane_id),
             prev_primitive=prev_primitive,
             target_ahead=target_delta > 0,

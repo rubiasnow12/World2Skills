@@ -673,9 +673,7 @@ def test_scripted_oracle_completes_causal_overtake_without_collision(
                 }
                 action_name = "FASTER" if "FASTER" in available_names else "IDLE"
 
-            _, _, terminated, truncated, _ = env.step(
-                name_to_index[action_name]
-            )
+            _, _, terminated, truncated, _ = env.step(name_to_index[action_name])
             scenario.update(env, t)
             done, reason = scenario.is_terminal(env)
             if done:
@@ -690,10 +688,7 @@ def test_scripted_oracle_completes_causal_overtake_without_collision(
         assert success is True, reason
         assert scenario.lane_change_completed_step is not None
         assert scenario.overtake_step is not None
-        assert (
-            scenario.lane_change_completed_step
-            < scenario.overtake_step
-        )
+        assert scenario.lane_change_completed_step < scenario.overtake_step
         assert scenario.collision is False
         assert terminated is False
         assert truncated is False
