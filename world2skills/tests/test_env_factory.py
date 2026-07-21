@@ -24,9 +24,7 @@ from world2skills.runtime.types import Grounding
 
 @pytest.fixture
 def grounding() -> Grounding:
-    return deepcopy(
-        select_grounding(load_skill("lane-change-overtake"), "highway-env")
-    )
+    return deepcopy(select_grounding(load_skill("lane-change-overtake"), "highway-env"))
 
 
 @pytest.fixture
@@ -42,12 +40,17 @@ def scenario_config() -> dict[str, Any]:
 
 
 class _TrackingEnv:
-    def __init__(self, reset_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        reset_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
         self.unwrapped = self
         self.render_mode = None
         self.closed = False
         self.configured_with: dict[str, Any] | None = None
         self.reset_error = reset_error
+        self.close_error = close_error
 
     def default_config(self) -> dict[str, Any]:
         return {
@@ -71,6 +74,8 @@ class _TrackingEnv:
 
     def close(self) -> None:
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 def _patch_make(
@@ -78,10 +83,11 @@ def _patch_make(
     grounding: Grounding,
     *,
     reset_error: Exception | None = None,
+    close_error: Exception | None = None,
 ) -> tuple[_TrackingEnv, dict[str, Any]]:
     import gymnasium
 
-    fake_env = _TrackingEnv(reset_error)
+    fake_env = _TrackingEnv(reset_error, close_error)
     make_kwargs: dict[str, Any] = {}
 
     def fake_make(environment: str, **kwargs: Any) -> _TrackingEnv:
@@ -128,8 +134,7 @@ def test_make_env_returns_resolved_kinematics_config_and_action_map(
         assert isinstance(env.action_space, Discrete)
         assert env.action_space.n == 5
         assert name_to_index == {
-            label: index
-            for index, label in env.unwrapped.action_type.actions.items()
+            label: index for index, label in env.unwrapped.action_type.actions.items()
         }
         assert name_to_index == {
             "LANE_LEFT": 0,
@@ -226,6 +231,45 @@ def test_resolve_env_config_closes_probe_when_validation_fails(
 
     assert fake_env.closed is True
     assert fake_env.configured_with is None
+
+
+def test_resolve_env_config_preserves_primary_error_and_adds_cleanup_note(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    scenario_config["vehcles_count"] = 10
+    fake_env, _ = _patch_make(
+        monkeypatch,
+        grounding,
+        close_error=RuntimeError("probe close failed"),
+    )
+
+    with pytest.raises(ValueError, match="vehcles_count") as captured:
+        resolve_env_config(grounding, scenario_config)
+
+    assert fake_env.closed is True
+    assert captured.value.__notes__ == [
+        "cleanup_error: RuntimeError: probe close failed"
+    ]
+
+
+def test_resolve_env_config_raises_close_error_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    fake_env, _ = _patch_make(
+        monkeypatch,
+        grounding,
+        close_error=RuntimeError("probe close failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="probe close failed") as captured:
+        resolve_env_config(grounding, scenario_config)
+
+    assert fake_env.closed is True
+    assert getattr(captured.value, "__notes__", []) == []
 
 
 def test_same_seed_produces_same_initial_observation_and_action_samples(
@@ -491,3 +535,22 @@ def test_make_env_closes_created_env_when_initialization_fails(
     assert fake_env.configured_with is not None
     assert fake_env.configured_with["observation"]["normalize"] is False
     assert fake_env.configured_with["action"] == {"type": "DiscreteMetaAction"}
+
+
+def test_make_env_preserves_primary_error_and_adds_cleanup_note(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    fake_env, _ = _patch_make(
+        monkeypatch,
+        grounding,
+        reset_error=RuntimeError("reset failed"),
+        close_error=RuntimeError("env close failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="reset failed") as captured:
+        make_env(grounding, scenario_config, seed=23)
+
+    assert fake_env.closed is True
+    assert captured.value.__notes__ == ["cleanup_error: RuntimeError: env close failed"]

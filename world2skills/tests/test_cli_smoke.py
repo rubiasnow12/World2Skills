@@ -15,7 +15,7 @@ pytest.importorskip("highway_env")
 
 from world2skills.evaluation import run
 from world2skills.runtime import env_factory as env_factory_module
-from world2skills.runtime.types import EpisodeResult
+from world2skills.runtime.types import EpisodeResult, StepRecord
 
 
 _ACTION_MAP = {
@@ -520,6 +520,148 @@ def test_low_level_env_creation_failure_publishes_honest_custom_fallback(
     )
     assert secret not in config_text
     assert client.close_calls == 1
+
+
+def test_artifacts_redact_provider_episode_trace_and_snapshot_strings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    api_key = "sk-live-raw-secret-123456"
+    bearer = "Bearer eyJhbGciOiJIUzI1NiJ9.secret.signature"
+    base_url = (
+        "https://user%40name:pass%2Fword@example.test/v1/"
+        "?api_key=query%2Fsecret&safe=visible"
+    )
+    decoded_values = ("user@name", "pass/word", "query/secret")
+    provider_url = (
+        "https://alice:password-value@example.test/path"
+        "?token=provider-token&safe=visible#fragment-secret"
+    )
+    model_secret = "sk-model-secret-123456"
+    monkeypatch.setenv("OPENAI_API_KEY", api_key)
+    monkeypatch.setenv("OPENAI_BASE_URL", base_url)
+
+    client = _FakeClient(model=model_secret)
+    client.base_url = base_url
+    client, _ = _patch_fast_success(monkeypatch, client=client)
+
+    def secret_run_episode(
+        env: _FakeEnv,
+        executor: Any,
+        scenario: Any,
+        seed: int,
+        max_steps: int,
+    ) -> EpisodeResult:
+        del executor, scenario, max_steps
+        env.close()
+        step = StepRecord(
+            t=0,
+            obs_summary=f"observation {decoded_values[0]} {provider_url}",
+            primitive="maintain-speed",
+            backend_action="IDLE",
+            action_index=1,
+            reward=0.0,
+            crashed=False,
+            request_hash="request-hash",
+            raw_response=f"reply {api_key} {bearer}",
+            cache_hit=False,
+            latency_ms=1.0,
+            decision_status="parse_fallback",
+            fallback_reason=f"fallback {decoded_values[1]} {provider_url}",
+            available_primitives=["maintain-speed"],
+        )
+        return EpisodeResult(
+            seed=seed,
+            status="ok",
+            success=False,
+            success_reason=f"reason {decoded_values[2]}",
+            episode_return=0.0,
+            crashed=False,
+            steps=1,
+            mean_speed=0.0,
+            parse_failures=1,
+            unavailable_action_attempts=0,
+            llm_errors=0,
+            terminated=False,
+            truncated=False,
+            max_steps_reached=True,
+            scenario_completed=False,
+            termination_reason="max_steps",
+            target_initially_ahead=False,
+            lane_change_completed_step=None,
+            overtake_step=None,
+            exception_message=f"setup {base_url}",
+            cleanup_error=f"cleanup {bearer}",
+            step_records=[step],
+        )
+
+    monkeypatch.setattr(run, "run_episode", secret_run_episode)
+    out = tmp_path / "redacted-artifacts"
+
+    assert (
+        run.main(
+            [
+                "--seeds",
+                "0",
+                "--model",
+                model_secret,
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+
+    artifact_text = "".join(
+        (out / filename).read_text(encoding="utf-8")
+        for filename in ("results.json", "config.json", "episode_0.jsonl")
+    )
+    for secret in (
+        api_key,
+        bearer,
+        base_url,
+        *decoded_values,
+        "alice",
+        "password-value",
+        "provider-token",
+        "fragment-secret",
+        model_secret,
+    ):
+        assert secret not in artifact_text
+    assert "<redacted>" in artifact_text
+
+    stored = _read_json(out / "results.json")["results"][0]
+    assert stored["status"] == "ok"
+    trace = json.loads((out / "episode_0.jsonl").read_text(encoding="utf-8"))
+    assert trace["primitive"] == "maintain-speed"
+    assert trace["decision_status"] == "parse_fallback"
+
+
+def test_exception_text_includes_redacted_notes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-note-secret-123456"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    error = RuntimeError(f"primary {secret}")
+    error.add_note(
+        "cleanup_error: RuntimeError: "
+        "https://user:password@example.test/?token=note-token "
+        "Bearer bearer-note-token"
+    )
+
+    rendered = run._exception_text(error)
+
+    assert rendered is not None
+    assert "notes:" in rendered
+    for value in (
+        secret,
+        "user",
+        "password",
+        "note-token",
+        "bearer-note-token",
+    ):
+        assert value not in rendered
+    assert "<redacted>" in rendered
 
 
 def test_all_scenario_constructor_failures_still_publish_environment_config(

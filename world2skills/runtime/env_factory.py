@@ -58,9 +58,7 @@ def _validate_grounding(grounding: Grounding) -> list[str]:
         )
 
     missing_features = [
-        feature
-        for feature in _RENDERER_REQUIRED_FEATURES
-        if feature not in features
+        feature for feature in _RENDERER_REQUIRED_FEATURES if feature not in features
     ]
     if missing_features:
         raise ValueError(
@@ -107,9 +105,7 @@ def _build_custom_config(
     config = deepcopy(scenario_config)
     reserved = sorted(_RESERVED_SCENARIO_KEYS.intersection(config))
     if reserved:
-        raise ValueError(
-            f"scenario_config cannot override reserved keys: {reserved}"
-        )
+        raise ValueError(f"scenario_config cannot override reserved keys: {reserved}")
 
     obs_vehicles_count = config.pop(
         "obs_vehicles_count",
@@ -222,8 +218,7 @@ def _validate_core_scenario_values(
         and simulation_frequency < policy_frequency
     ):
         raise ValueError(
-            "simulation_frequency must be greater than or equal to "
-            "policy_frequency"
+            "simulation_frequency must be greater than or equal to policy_frequency"
         )
 
 
@@ -231,9 +226,7 @@ def _invert_action_map(env: Any) -> dict[str, int]:
     import gymnasium
 
     if not isinstance(env.action_space, gymnasium.spaces.Discrete):
-        raise ValueError(
-            "highway-env action space must be gymnasium.spaces.Discrete"
-        )
+        raise ValueError("highway-env action space must be gymnasium.spaces.Discrete")
 
     actions = getattr(env.unwrapped.action_type, "actions", None)
     if not isinstance(actions, Mapping) or not actions:
@@ -245,9 +238,7 @@ def _invert_action_map(env: Any) -> dict[str, int]:
     indexes: list[int] = []
     for index, label in actions.items():
         if type(index) is not int:
-            raise ValueError(
-                "DiscreteMetaAction.actions indexes must be integers"
-            )
+            raise ValueError("DiscreteMetaAction.actions indexes must be integers")
         if not isinstance(label, str) or not label.strip():
             raise ValueError(
                 "DiscreteMetaAction.actions labels must be non-empty strings"
@@ -272,10 +263,7 @@ def _validate_backend_actions(
     name_to_index: Mapping[str, int],
 ) -> None:
     backend_labels = list(grounding.primitive_map.values())
-    if any(
-        not isinstance(label, str) or not label.strip()
-        for label in backend_labels
-    ):
+    if any(not isinstance(label, str) or not label.strip() for label in backend_labels):
         raise ValueError(
             "grounding primitive_map backend labels must be non-empty strings"
         )
@@ -285,6 +273,15 @@ def _validate_backend_actions(
         raise ValueError(
             "grounding primitive_map references unavailable backend action "
             f"labels: {missing}"
+        )
+
+
+def _close_after_primary_error(env: Any, primary: Exception) -> None:
+    try:
+        env.close()
+    except Exception as cleanup_error:
+        primary.add_note(
+            f"cleanup_error: {type(cleanup_error).__name__}: {cleanup_error}"
         )
 
 
@@ -302,13 +299,17 @@ def resolve_env_config(
             grounding,
             scenario_config,
         )
-        return _complete_resolved_config(
+        resolved = _complete_resolved_config(
             env,
             custom_config,
         )
-    finally:
+    except Exception as primary:
         if env is not None:
-            env.close()
+            _close_after_primary_error(env, primary)
+        raise
+
+    env.close()
+    return resolved
 
 
 def make_env(
@@ -351,10 +352,7 @@ def make_env(
         name_to_index = _invert_action_map(env)
         _validate_backend_actions(grounding, name_to_index)
         return env, name_to_index
-    except Exception:
+    except Exception as primary:
         if env is not None:
-            try:
-                env.close()
-            except Exception:
-                pass
+            _close_after_primary_error(env, primary)
         raise

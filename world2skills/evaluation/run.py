@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import yaml
 
@@ -88,6 +88,24 @@ _DISTRIBUTIONS = (
 )
 _EGO_LANE = re.compile(r"^Ego: .* lane=(?P<lane>\d+)", re.MULTILINE)
 _ENDPOINT_PATH_HASH_LENGTH = 16
+_REDACTION = "<redacted>"
+_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_BEARER = re.compile(
+    r"\bBearer\s+[A-Za-z0-9._~+/=-]+",
+    re.IGNORECASE,
+)
+_SK_KEY = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{7,}\b")
+_SENSITIVE_QUERY_MARKERS = (
+    "token",
+    "key",
+    "apikey",
+    "secret",
+    "password",
+    "credential",
+    "signature",
+    "auth",
+    "authorization",
+)
 
 
 def _nonnegative_seed(value: str) -> int:
@@ -409,15 +427,138 @@ def _client_snapshot(
 def _exception_text(error: Exception | None) -> str | None:
     if error is None:
         return None
-    return f"{type(error).__name__}: {_redact_secrets(str(error))}"
+    rendered = f"{type(error).__name__}: {error}"
+    notes = getattr(error, "__notes__", ())
+    if notes:
+        rendered += " | notes: " + " | ".join(str(note) for note in notes)
+    return _redact_secrets(rendered)
 
 
 def _redact_secrets(text: str) -> str:
-    redacted = text
+    redacted = _URL.sub(_redact_url_match, str(text))
+    variants: set[str] = set()
     for name, value in os.environ.items():
         if value and any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS):
-            redacted = redacted.replace(value, "<redacted>")
+            variants.update(_secret_variants(value))
+    for value in sorted(variants, key=len, reverse=True):
+        redacted = redacted.replace(value, _REDACTION)
+    redacted = _BEARER.sub(f"Bearer {_REDACTION}", redacted)
+    redacted = _SK_KEY.sub(_REDACTION, redacted)
     return redacted
+
+
+def _secret_variants(value: str) -> set[str]:
+    variants = {value, unquote(value)}
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return {variant for variant in variants if variant}
+    if parsed.scheme and parsed.netloc:
+        for component in (
+            parsed.username,
+            parsed.password,
+            parsed.path,
+            parsed.query,
+        ):
+            if component:
+                variants.add(component)
+                variants.add(unquote(component))
+        for _, query_value in parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        ):
+            if query_value:
+                variants.add(query_value)
+                variants.add(unquote(query_value))
+    return {variant for variant in variants if variant}
+
+
+def _sensitive_query_name(name: str) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", name.lower())
+    return any(
+        compact == marker or compact.startswith(marker) or compact.endswith(marker)
+        for marker in _SENSITIVE_QUERY_MARKERS
+    )
+
+
+def _redact_url_match(match: re.Match[str]) -> str:
+    raw_url = match.group(0)
+    trailing = ""
+    while raw_url and raw_url[-1] in ".,);]":
+        trailing = raw_url[-1] + trailing
+        raw_url = raw_url[:-1]
+    try:
+        parsed = urlsplit(raw_url)
+        hostname = parsed.hostname
+        if hostname is None:
+            return f"{_REDACTION}{trailing}"
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        if parsed.username is not None or parsed.password is not None:
+            host = f"{_REDACTION}@{host}"
+        query = urlencode(
+            [
+                (
+                    name,
+                    _REDACTION if _sensitive_query_name(name) else value,
+                )
+                for name, value in parse_qsl(
+                    parsed.query,
+                    keep_blank_values=True,
+                )
+            ]
+        )
+        fragment = _REDACTION if parsed.fragment else ""
+        sanitized = urlunsplit(
+            (
+                parsed.scheme,
+                host,
+                parsed.path,
+                query,
+                fragment,
+            )
+        )
+        return f"{sanitized}{trailing}"
+    except ValueError:
+        return f"{_REDACTION}{trailing}"
+
+
+def _sanitize_episode_results(
+    results: list[EpisodeResult],
+) -> list[EpisodeResult]:
+    sanitized = deepcopy(results)
+    for result in sanitized:
+        for field_name in (
+            "success_reason",
+            "exception_message",
+            "cleanup_error",
+        ):
+            value = getattr(result, field_name)
+            if isinstance(value, str):
+                setattr(result, field_name, _redact_secrets(value))
+        for record in result.step_records:
+            for field_name in (
+                "raw_response",
+                "fallback_reason",
+                "obs_summary",
+            ):
+                value = getattr(record, field_name)
+                if isinstance(value, str):
+                    setattr(record, field_name, _redact_secrets(value))
+    return sanitized
+
+
+def _sanitize_snapshot(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_secrets(value)
+    if isinstance(value, dict):
+        return {key: _sanitize_snapshot(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_snapshot(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_snapshot(item) for item in value)
+    return deepcopy(value)
 
 
 def _close_resource(resource: Any) -> str | None:
@@ -719,12 +860,13 @@ def main(argv: list[str] | None = None) -> int:
                 "resolution_error": _exception_text(exc),
                 "custom_config": custom_config,
             }
+    sanitized_results = _sanitize_episode_results(results)
     batch = aggregate(
-        results,
-        model=actual_model,
-        prompt_version=config["prompt_version"],
-        skill=card.name,
-        environment=grounding.environment,
+        sanitized_results,
+        model=_redact_secrets(actual_model),
+        prompt_version=_redact_secrets(config["prompt_version"]),
+        skill=_redact_secrets(card.name),
+        environment=_redact_secrets(grounding.environment),
         seeds=list(parsed.seeds),
     )
     snapshot = _resolved_snapshot(
@@ -737,7 +879,12 @@ def main(argv: list[str] | None = None) -> int:
         client_snapshot=client_snapshot,
         environment_config=environment_config,
     )
-    write_outputs(out, batch, results, snapshot)
+    write_outputs(
+        out,
+        batch,
+        sanitized_results,
+        _sanitize_snapshot(snapshot),
+    )
     print(
         f"[w2s] wrote {out / 'results.json'} "
         f"success_rate={batch.success_rate:.2f} "
