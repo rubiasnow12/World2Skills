@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,12 @@ from world2skills.runtime.types import (
 )
 
 
-def _step(*, obs_summary: str = "full observation\nwith context") -> StepRecord:
+def _step(
+    *,
+    obs_summary: str = "full observation\nwith context",
+    reward: float | None = 0.75,
+    crashed: bool = False,
+) -> StepRecord:
     decision = DecisionResult(
         primitive="maintain-speed",
         backend_action="IDLE",
@@ -36,8 +42,8 @@ def _step(*, obs_summary: str = "full observation\nwith context") -> StepRecord:
         decision,
         t=0,
         obs_summary=obs_summary,
-        reward=0.75,
-        crashed=False,
+        reward=reward,
+        crashed=crashed,
     )
 
 
@@ -56,21 +62,36 @@ def _episode(
     *,
     status: str = "ok",
     success: bool = False,
-    crashed: bool = False,
-    episode_return: float = 10.0,
+    crashed: bool | None = None,
+    episode_return: float | None = None,
     step_records: list[StepRecord] | None = None,
     exception_type: str | None = None,
     exception_message: str | None = None,
     cleanup_error: str | None = None,
 ) -> EpisodeResult:
+    records = list(step_records or [])
+    resolved_return = (
+        math.fsum(
+            record.reward
+            for record in records
+            if record.reward is not None
+        )
+        if episode_return is None
+        else episode_return
+    )
+    resolved_crashed = (
+        any(record.crashed for record in records)
+        if crashed is None
+        else crashed
+    )
     return EpisodeResult(
         seed=seed,
         status=status,
         success=success,
         success_reason="overtake complete" if success else "",
-        episode_return=episode_return,
-        crashed=crashed,
-        steps=len(step_records or []),
+        episode_return=resolved_return,
+        crashed=resolved_crashed,
+        steps=len(records),
         mean_speed=20.0,
         parse_failures=0,
         unavailable_action_attempts=0,
@@ -87,7 +108,7 @@ def _episode(
         exception_type=exception_type,
         exception_message=exception_message,
         cleanup_error=cleanup_error,
-        step_records=list(step_records or []),
+        step_records=records,
     )
 
 
@@ -113,8 +134,7 @@ def test_episode_to_result_dict_excludes_only_step_records() -> None:
     episode = _episode(
         4,
         status="error",
-        crashed=True,
-        step_records=[_step()],
+        step_records=[_step(crashed=True)],
         exception_type="RuntimeError",
         exception_message="provider failed",
         cleanup_error="close failed",
@@ -133,13 +153,19 @@ def test_episode_to_result_dict_excludes_only_step_records() -> None:
 
 def test_aggregate_counts_rates_and_collided_error_episode() -> None:
     results = [
-        _episode(0, success=True, episode_return=20.0),
-        _episode(1, crashed=True, episode_return=5.0),
+        _episode(
+            0,
+            success=True,
+            step_records=[_step(reward=20.0)],
+        ),
+        _episode(
+            1,
+            step_records=[_step(reward=5.0, crashed=True)],
+        ),
         _episode(
             2,
             status="error",
-            crashed=True,
-            episode_return=1000.0,
+            step_records=[_step(reward=1000.0, crashed=True)],
             exception_type="RuntimeError",
         ),
     ]
@@ -302,6 +328,9 @@ def test_aggregate_rejects_step_count_trace_mismatch() -> None:
     [
         ({"t": 1}, r"step_records\[0\]\.t"),
         ({"t": "0"}, r"step_records\[0\]\.t"),
+        ({"obs_summary": ""}, "obs_summary"),
+        ({"obs_summary": "   "}, "obs_summary"),
+        ({"obs_summary": None}, "obs_summary"),
         ({"primitive": ""}, "primitive"),
         ({"primitive": "   "}, "primitive"),
         ({"backend_action": ""}, "backend_action"),
@@ -350,6 +379,61 @@ def test_aggregate_rejects_missing_fallback_reason() -> None:
 
     with pytest.raises(ValueError, match="fallback_reason"):
         _batch([episode])
+
+
+@pytest.mark.parametrize("status", ["ok", "error"])
+def test_aggregate_rejects_episode_return_trace_mismatch(
+    status: str,
+) -> None:
+    episode = replace(
+        _episode(
+            0,
+            status=status,
+            step_records=[_step(reward=0.25)],
+        ),
+        episode_return=0.5,
+    )
+
+    with pytest.raises(ValueError, match="episode_return.*recorded rewards"):
+        _batch([episode])
+
+
+@pytest.mark.parametrize("status", ["ok", "error"])
+@pytest.mark.parametrize(
+    ("record_crashed", "summary_crashed"),
+    [
+        (True, False),
+        (False, True),
+    ],
+)
+def test_aggregate_rejects_crash_trace_mismatch(
+    status: str,
+    record_crashed: bool,
+    summary_crashed: bool,
+) -> None:
+    episode = replace(
+        _episode(
+            0,
+            status=status,
+            step_records=[_step(crashed=record_crashed)],
+        ),
+        crashed=summary_crashed,
+    )
+
+    with pytest.raises(ValueError, match="crashed.*step_records"):
+        _batch([episode])
+
+
+def test_aggregate_excludes_none_rewards_from_episode_return() -> None:
+    episode = _episode(
+        0,
+        status="error",
+        step_records=[_step(reward=None)],
+    )
+
+    batch = _batch([episode])
+
+    assert batch.results[0]["episode_return"] == 0.0
 
 
 def test_ok_episode_accepts_exact_trace_fallback_counts() -> None:

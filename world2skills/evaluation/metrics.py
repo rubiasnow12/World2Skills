@@ -54,6 +54,8 @@ _FINITE_NUMBER_FIELDS = (
     "mean_speed",
 )
 _OPTIONAL_FINITE_NUMBER_FIELDS = ("lead_initial_gap_m",)
+_RETURN_REL_TOLERANCE = 1e-12
+_RETURN_ABS_TOLERANCE = 1e-12
 
 
 def episode_to_result_dict(result: EpisodeResult) -> dict[str, Any]:
@@ -134,6 +136,12 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
                 f"{field_name} must be a nonnegative integer or None"
             )
 
+    if result.steps != len(result.step_records):
+        raise ValueError("steps must equal len(step_records)")
+    trace_counts, trace_return, trace_crashed = _validate_step_records(
+        result.step_records
+    )
+
     for field_name in _FINITE_NUMBER_FIELDS:
         _validate_finite_number(getattr(result, field_name), field_name)
 
@@ -152,9 +160,20 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
             "lead_initial_gap_m must be finite and positive"
         )
 
-    if result.steps != len(result.step_records):
-        raise ValueError("steps must equal len(step_records)")
-    trace_counts = _validate_step_records(result.step_records)
+    if not math.isclose(
+        result.episode_return,
+        trace_return,
+        rel_tol=_RETURN_REL_TOLERANCE,
+        abs_tol=_RETURN_ABS_TOLERANCE,
+    ):
+        raise ValueError(
+            "episode_return must equal the sum of recorded rewards"
+        )
+    if result.crashed != trace_crashed:
+        raise ValueError(
+            "crashed must equal any(record.crashed) in step_records"
+        )
+
     fallback_count = (
         result.parse_failures
         + result.unavailable_action_attempts
@@ -220,12 +239,14 @@ def _validate_success_contract(result: EpisodeResult) -> None:
 
 def _validate_step_records(
     records: list[StepRecord],
-) -> dict[str, int]:
+) -> tuple[dict[str, int], float, bool]:
     counts = {
         "parse_failures": 0,
         "unavailable_action_attempts": 0,
         "llm_errors": 0,
     }
+    rewards: list[Real] = []
+    crashed = False
     for index, record in enumerate(records):
         prefix = f"step_records[{index}]"
         if not isinstance(record, StepRecord):
@@ -234,6 +255,10 @@ def _validate_step_records(
             raise ValueError(
                 f"{prefix}.t must equal its sequential list index"
             )
+        _validate_nonempty_string(
+            record.obs_summary,
+            f"{prefix}.obs_summary",
+        )
         _validate_nonempty_string(record.primitive, f"{prefix}.primitive")
         _validate_nonempty_string(
             record.backend_action,
@@ -249,9 +274,11 @@ def _validate_step_records(
                 f"{prefix}.reward",
                 nonnegative=False,
             )
+            rewards.append(record.reward)
         for field_name in ("crashed", "cache_hit"):
             if type(getattr(record, field_name)) is not bool:
                 raise ValueError(f"{prefix}.{field_name} must be bool")
+        crashed = crashed or record.crashed
         _validate_nonempty_string(
             record.request_hash,
             f"{prefix}.request_hash",
@@ -302,7 +329,13 @@ def _validate_step_records(
                 f"{prefix}.available_primitives must contain "
                 "the chosen primitive"
             )
-    return counts
+    try:
+        episode_return = math.fsum(rewards)
+    except OverflowError as exc:
+        raise ValueError(
+            "recorded rewards must have a finite sum"
+        ) from exc
+    return counts, episode_return, crashed
 
 
 def _validate_fallback_counters(
