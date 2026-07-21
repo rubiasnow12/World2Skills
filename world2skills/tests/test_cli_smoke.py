@@ -522,6 +522,33 @@ def test_low_level_env_creation_failure_publishes_honest_custom_fallback(
     assert client.close_calls == 1
 
 
+def test_setup_cleanup_note_populates_separate_episode_cleanup_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    secret = "sk-cleanup-note-secret-123456"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    client, _ = _patch_fast_success(monkeypatch)
+
+    def fail_make_env(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        error = RuntimeError("setup primary failed")
+        error.add_note(f"cleanup_error: RuntimeError: close failed with {secret}")
+        raise error
+
+    monkeypatch.setattr(run, "make_env", fail_make_env)
+    out = tmp_path / "setup-cleanup-note"
+
+    assert run.main(["--seeds", "0", "--mock", "--out", str(out)]) == 0
+
+    result = _read_json(out / "results.json")["results"][0]
+    assert result["status"] == "error"
+    assert result["exception_message"] == "setup primary failed"
+    assert result["cleanup_error"] == "RuntimeError: close failed with <redacted>"
+    assert secret not in (out / "results.json").read_text(encoding="utf-8")
+    assert client.close_calls == 1
+
+
 def test_artifacts_redact_provider_episode_trace_and_snapshot_strings(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -662,6 +689,96 @@ def test_exception_text_includes_redacted_notes(
     ):
         assert value not in rendered
     assert "<redacted>" in rendered
+
+
+def test_root_endpoint_identity_survives_recursive_snapshot_sanitizing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root_endpoint = "https://example.test/"
+    monkeypatch.setenv("OPENAI_BASE_URL", root_endpoint)
+    client = _FakeClient()
+    client.base_url = root_endpoint
+    _patch_fast_success(monkeypatch, client=client)
+    out = tmp_path / "root-endpoint"
+
+    assert (
+        run.main(
+            [
+                "--seeds",
+                "0",
+                "--model",
+                "gpt-5.4",
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+
+    config = _read_json(out / "config.json")
+    assert config["requested"]["base_url"] == root_endpoint
+    assert config["client"]["base_url"] == root_endpoint
+
+
+def test_short_sensitive_env_values_do_not_corrupt_snapshot_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("TOKEN", "/")
+    monkeypatch.setenv("API_KEY", "short")
+    _patch_fast_success(monkeypatch)
+    out = tmp_path / "short-secrets"
+
+    assert run.main(["--seeds", "0", "--mock", "--out", str(out)]) == 0
+
+    config = _read_json(out / "config.json")
+    assert config["skill"]["name"] == "lane-change-overtake"
+    assert config["client"]["type"] == "_FakeClient"
+    assert config["client"]["model"] == "actual-deployment"
+    assert config["source_config"]["path"].startswith("/")
+
+
+def test_exception_url_keeps_origin_and_hash_without_plaintext_components() -> None:
+    raw_url = (
+        "https://user:password@example.test/private/path"
+        "?token=query-secret&safe=visible#fragment-secret"
+    )
+    expected_hash = hashlib.sha256(
+        b"/private/path\0token=query-secret&safe=visible"
+    ).hexdigest()[:16]
+
+    redacted = run._redact_secrets(f"provider failed at {raw_url}")
+
+    assert f"https://example.test/_path_sha256_{expected_hash}/" in redacted
+    for secret in (
+        "user",
+        "password",
+        "private",
+        "query-secret",
+        "visible",
+        "fragment-secret",
+    ):
+        assert secret not in redacted
+
+
+def test_snapshot_preserves_already_sanitized_base_url_identity() -> None:
+    endpoint = run._sanitize_endpoint(
+        "https://user:password@example.test/v1?token=secret"
+    )
+    assert endpoint is not None
+
+    sanitized = run._sanitize_snapshot(
+        {
+            "client": {"base_url": endpoint},
+            "message": ("https://user:password@example.test/v1?token=secret"),
+        }
+    )
+
+    assert sanitized["client"]["base_url"] == endpoint
+    assert sanitized["message"] == endpoint
+    assert "password" not in sanitized["message"]
+    assert "secret" not in sanitized["message"]
 
 
 def test_all_scenario_constructor_failures_still_publish_environment_config(

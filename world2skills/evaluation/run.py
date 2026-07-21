@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 import yaml
 
@@ -439,7 +439,7 @@ def _redact_secrets(text: str) -> str:
     variants: set[str] = set()
     for name, value in os.environ.items():
         if value and any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS):
-            variants.update(_secret_variants(value))
+            variants.update(_secret_variants(name, value))
     for value in sorted(variants, key=len, reverse=True):
         redacted = redacted.replace(value, _REDACTION)
     redacted = _BEARER.sub(f"Bearer {_REDACTION}", redacted)
@@ -447,30 +447,38 @@ def _redact_secrets(text: str) -> str:
     return redacted
 
 
-def _secret_variants(value: str) -> set[str]:
-    variants = {value, unquote(value)}
+def _secret_variants(name: str, value: str) -> set[str]:
+    env_name = name.upper()
+    endpoint_value = "BASE_URL" in env_name or "ENDPOINT" in env_name
+    if not endpoint_value:
+        return {
+            variant
+            for variant in (value, unquote(value))
+            if _informative_secret_variant(variant)
+        }
+
+    variants: set[str] = set()
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return {variant for variant in variants if variant}
+        return variants
     if parsed.scheme and parsed.netloc:
-        for component in (
-            parsed.username,
-            parsed.password,
-            parsed.path,
-            parsed.query,
-        ):
+        for component in (parsed.username, parsed.password):
             if component:
                 variants.add(component)
                 variants.add(unquote(component))
-        for _, query_value in parse_qsl(
+        for query_name, query_value in parse_qsl(
             parsed.query,
             keep_blank_values=True,
         ):
-            if query_value:
+            if query_value and _sensitive_query_name(query_name):
                 variants.add(query_value)
                 variants.add(unquote(query_value))
-    return {variant for variant in variants if variant}
+    return {variant for variant in variants if _informative_secret_variant(variant)}
+
+
+def _informative_secret_variant(value: str) -> bool:
+    return len(value) >= 8 and value not in {"/", "http://", "https://"}
 
 
 def _sensitive_query_name(name: str) -> bool:
@@ -488,38 +496,8 @@ def _redact_url_match(match: re.Match[str]) -> str:
         trailing = raw_url[-1] + trailing
         raw_url = raw_url[:-1]
     try:
-        parsed = urlsplit(raw_url)
-        hostname = parsed.hostname
-        if hostname is None:
-            return f"{_REDACTION}{trailing}"
-        host = f"[{hostname}]" if ":" in hostname else hostname
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
-        if parsed.username is not None or parsed.password is not None:
-            host = f"{_REDACTION}@{host}"
-        query = urlencode(
-            [
-                (
-                    name,
-                    _REDACTION if _sensitive_query_name(name) else value,
-                )
-                for name, value in parse_qsl(
-                    parsed.query,
-                    keep_blank_values=True,
-                )
-            ]
-        )
-        fragment = _REDACTION if parsed.fragment else ""
-        sanitized = urlunsplit(
-            (
-                parsed.scheme,
-                host,
-                parsed.path,
-                query,
-                fragment,
-            )
-        )
-        return f"{sanitized}{trailing}"
+        sanitized = _sanitize_endpoint(raw_url)
+        return f"{sanitized or _REDACTION}{trailing}"
     except ValueError:
         return f"{_REDACTION}{trailing}"
 
@@ -549,11 +527,19 @@ def _sanitize_episode_results(
     return sanitized
 
 
-def _sanitize_snapshot(value: Any) -> Any:
+def _sanitize_snapshot(value: Any, key: str | None = None) -> Any:
     if isinstance(value, str):
+        if key == "base_url":
+            return value
         return _redact_secrets(value)
     if isinstance(value, dict):
-        return {key: _sanitize_snapshot(item) for key, item in value.items()}
+        return {
+            item_key: _sanitize_snapshot(
+                item,
+                str(item_key),
+            )
+            for item_key, item in value.items()
+        }
     if isinstance(value, list):
         return [_sanitize_snapshot(item) for item in value]
     if isinstance(value, tuple):
@@ -576,6 +562,31 @@ def _scenario_value(scenario: Any | None, name: str, default: Any) -> Any:
         return getattr(scenario, name, default)
     except Exception:
         return default
+
+
+def _cleanup_errors_from_notes(error: Exception) -> list[str]:
+    prefix = "cleanup_error:"
+    values: list[str] = []
+    for note in getattr(error, "__notes__", ()):
+        text = str(note).strip()
+        if text.startswith(prefix):
+            value = text[len(prefix) :].strip()
+            if value:
+                values.append(_redact_secrets(value))
+    return values
+
+
+def _merged_cleanup_error(
+    explicit: str | None,
+    error: Exception,
+) -> str | None:
+    values = []
+    if explicit:
+        values.append(_redact_secrets(explicit))
+    for value in _cleanup_errors_from_notes(error):
+        if value not in values:
+            values.append(value)
+    return " | ".join(values) if values else None
 
 
 def _error_episode(
@@ -613,7 +624,7 @@ def _error_episode(
         lead_initial_gap_m=float(lead_gap) if lead_gap is not None else None,
         exception_type=type(error).__name__,
         exception_message=_redact_secrets(str(error)),
-        cleanup_error=cleanup_error,
+        cleanup_error=_merged_cleanup_error(cleanup_error, error),
     )
 
 
