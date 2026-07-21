@@ -12,11 +12,24 @@ import shutil
 import tempfile
 from typing import Any
 
-from ..runtime.types import BatchResult, EpisodeResult
+from ..runtime.types import BatchResult, EpisodeResult, StepRecord
 
 
 SCHEMA_VERSION = "0.1"
 _VALID_STATUSES = frozenset({"ok", "error"})
+_VALID_DECISION_STATUSES = frozenset(
+    {
+        "ok",
+        "parse_fallback",
+        "unavailable_fallback",
+        "llm_error_fallback",
+    }
+)
+_FALLBACK_COUNTERS = {
+    "parse_fallback": "parse_failures",
+    "unavailable_fallback": "unavailable_action_attempts",
+    "llm_error_fallback": "llm_errors",
+}
 _BOOLEAN_FIELDS = (
     "success",
     "crashed",
@@ -141,6 +154,7 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
 
     if result.steps != len(result.step_records):
         raise ValueError("steps must equal len(step_records)")
+    trace_counts = _validate_step_records(result.step_records)
     fallback_count = (
         result.parse_failures
         + result.unavailable_action_attempts
@@ -156,6 +170,7 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
         raise ValueError(
             f"fallback counter sum must not exceed {limit_name}"
         )
+    _validate_fallback_counters(result, trace_counts)
 
     if result.status == "error":
         if result.success:
@@ -203,6 +218,141 @@ def _validate_success_contract(result: EpisodeResult) -> None:
         )
 
 
+def _validate_step_records(
+    records: list[StepRecord],
+) -> dict[str, int]:
+    counts = {
+        "parse_failures": 0,
+        "unavailable_action_attempts": 0,
+        "llm_errors": 0,
+    }
+    for index, record in enumerate(records):
+        prefix = f"step_records[{index}]"
+        if not isinstance(record, StepRecord):
+            raise ValueError(f"{prefix} must be a StepRecord")
+        if type(record.t) is not int or record.t != index:
+            raise ValueError(
+                f"{prefix}.t must equal its sequential list index"
+            )
+        _validate_nonempty_string(record.primitive, f"{prefix}.primitive")
+        _validate_nonempty_string(
+            record.backend_action,
+            f"{prefix}.backend_action",
+        )
+        if type(record.action_index) is not int or record.action_index < 0:
+            raise ValueError(
+                f"{prefix}.action_index must be a nonnegative integer"
+            )
+        if record.reward is not None:
+            _validate_step_number(
+                record.reward,
+                f"{prefix}.reward",
+                nonnegative=False,
+            )
+        for field_name in ("crashed", "cache_hit"):
+            if type(getattr(record, field_name)) is not bool:
+                raise ValueError(f"{prefix}.{field_name} must be bool")
+        _validate_nonempty_string(
+            record.request_hash,
+            f"{prefix}.request_hash",
+        )
+        if not isinstance(record.raw_response, str):
+            raise ValueError(f"{prefix}.raw_response must be str")
+        _validate_step_number(
+            record.latency_ms,
+            f"{prefix}.latency_ms",
+            nonnegative=True,
+        )
+        if (
+            not isinstance(record.decision_status, str)
+            or record.decision_status not in _VALID_DECISION_STATUSES
+        ):
+            raise ValueError(
+                f"{prefix}.decision_status is invalid"
+            )
+        if record.decision_status == "ok":
+            if record.fallback_reason is not None:
+                raise ValueError(
+                    f"{prefix}.fallback_reason must be None for ok decisions"
+                )
+        else:
+            _validate_nonempty_string(
+                record.fallback_reason,
+                f"{prefix}.fallback_reason",
+            )
+            counter_name = _FALLBACK_COUNTERS[record.decision_status]
+            counts[counter_name] += 1
+
+        primitives = record.available_primitives
+        if (
+            type(primitives) is not list
+            or not primitives
+            or any(
+                not isinstance(primitive, str) or not primitive.strip()
+                for primitive in primitives
+            )
+            or len(set(primitives)) != len(primitives)
+        ):
+            raise ValueError(
+                f"{prefix}.available_primitives must be unique "
+                "non-empty strings"
+            )
+        if record.primitive not in primitives:
+            raise ValueError(
+                f"{prefix}.available_primitives must contain "
+                "the chosen primitive"
+            )
+    return counts
+
+
+def _validate_fallback_counters(
+    result: EpisodeResult,
+    trace_counts: dict[str, int],
+) -> None:
+    untraced_total = 0
+    for field_name, trace_count in trace_counts.items():
+        summary_count = getattr(result, field_name)
+        if trace_count > summary_count:
+            raise ValueError(
+                f"{field_name} trace count exceeds episode summary"
+            )
+        if result.status == "ok" and trace_count != summary_count:
+            raise ValueError(
+                f"{field_name} must exactly match trace count "
+                "for ok episodes"
+            )
+        untraced_total += summary_count - trace_count
+
+    if result.status == "error" and untraced_total > 1:
+        raise ValueError(
+            "error episode fallback summary may exceed trace "
+            "counts by at most one decision"
+        )
+
+
+def _validate_nonempty_string(value: object, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+
+
+def _validate_step_number(
+    value: object,
+    field_name: str,
+    *,
+    nonnegative: bool,
+) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+        or (nonnegative and value < 0)
+    ):
+        qualifier = "finite nonnegative" if nonnegative else "finite"
+        raise ValueError(
+            f"{field_name} must be a {qualifier} Real for strict JSON"
+        )
+
+
 def _validate_finite_number(value: object, field_name: str) -> None:
     if (
         isinstance(value, bool)
@@ -240,6 +390,13 @@ def aggregate(
 ) -> BatchResult:
     """Validate and aggregate exactly one episode for every requested seed."""
 
+    for field_name, value in (
+        ("model", model),
+        ("prompt_version", prompt_version),
+        ("skill", skill),
+        ("environment", environment),
+    ):
+        _validate_nonempty_string(value, field_name)
     validated_seeds = _validate_seeds(seeds)
     ordered = _ordered_results(results, validated_seeds)
     summaries = [episode_to_result_dict(result) for result in ordered]
@@ -321,6 +478,15 @@ def _write_staged_file(path: Path, text: str) -> None:
         os.fsync(handle.fileno())
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _require_absent_or_empty_directory(path: Path) -> bool:
     if not path.exists():
         return False
@@ -343,6 +509,7 @@ def _publish_staged_directory(
             out.rmdir()
             removed_empty_target = True
         os.replace(staging, out)
+        _fsync_directory(out.parent)
     except Exception:
         if removed_empty_target and not out.exists():
             out.mkdir()
@@ -396,6 +563,7 @@ def write_outputs(
                 staging / f"episode_{seed}.jsonl",
                 trace_texts[seed],
             )
+        _fsync_directory(staging)
         _publish_staged_directory(staging, out)
         staging = None
     finally:

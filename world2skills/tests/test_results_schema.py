@@ -41,6 +41,16 @@ def _step(*, obs_summary: str = "full observation\nwith context") -> StepRecord:
     )
 
 
+def _fallback_step(
+    decision_status: str = "parse_fallback",
+) -> StepRecord:
+    return replace(
+        _step(),
+        decision_status=decision_status,
+        fallback_reason=f"{decision_status} reason",
+    )
+
+
 def _episode(
     seed: int,
     *,
@@ -208,6 +218,27 @@ def test_aggregate_rejects_invalid_episode_status(status: str) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
+        ("model", ""),
+        ("model", "   "),
+        ("prompt_version", 1),
+        ("skill", None),
+        ("environment", []),
+    ],
+)
+def test_aggregate_rejects_invalid_experiment_metadata(
+    field: str,
+    value: object,
+) -> None:
+    metadata = _metadata([0])
+    metadata[field] = value
+
+    with pytest.raises(ValueError, match=rf"{field}.*non-empty string"):
+        aggregate([_episode(0)], **metadata)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
         ("success", 1),
         ("crashed", 2),
         ("terminated", 0),
@@ -264,6 +295,118 @@ def test_aggregate_rejects_step_count_trace_mismatch() -> None:
 
     with pytest.raises(ValueError, match="steps.*step_records"):
         _batch([episode])
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({"t": 1}, r"step_records\[0\]\.t"),
+        ({"t": "0"}, r"step_records\[0\]\.t"),
+        ({"primitive": ""}, "primitive"),
+        ({"primitive": "   "}, "primitive"),
+        ({"backend_action": ""}, "backend_action"),
+        ({"action_index": -1}, "action_index"),
+        ({"action_index": True}, "action_index"),
+        ({"reward": float("nan")}, "reward"),
+        ({"reward": True}, "reward"),
+        ({"crashed": 0}, "crashed"),
+        ({"cache_hit": 1}, "cache_hit"),
+        ({"request_hash": ""}, "request_hash"),
+        ({"raw_response": None}, "raw_response"),
+        ({"latency_ms": float("inf")}, "latency_ms"),
+        ({"latency_ms": -0.01}, "latency_ms"),
+        ({"decision_status": "fallback"}, "decision_status"),
+        ({"decision_status": []}, "decision_status"),
+        ({"fallback_reason": "unexpected"}, "fallback_reason"),
+        ({"available_primitives": []}, "available_primitives"),
+        (
+            {"available_primitives": ["maintain-speed", "maintain-speed"]},
+            "available_primitives",
+        ),
+        ({"available_primitives": [""]}, "available_primitives"),
+        ({"available_primitives": ["accelerate"]}, "chosen primitive"),
+    ],
+)
+def test_aggregate_rejects_malformed_step_record(
+    changes: dict[str, object],
+    error: str,
+) -> None:
+    step = replace(_step(), **changes)
+    episode = _episode(0, step_records=[step])
+
+    with pytest.raises(ValueError, match=error):
+        _batch([episode])
+
+
+def test_aggregate_rejects_missing_fallback_reason() -> None:
+    step = replace(
+        _fallback_step(),
+        fallback_reason=None,
+    )
+    episode = replace(
+        _episode(0, step_records=[step]),
+        parse_failures=1,
+    )
+
+    with pytest.raises(ValueError, match="fallback_reason"):
+        _batch([episode])
+
+
+def test_ok_episode_accepts_exact_trace_fallback_counts() -> None:
+    episode = replace(
+        _episode(0, step_records=[_fallback_step()]),
+        parse_failures=1,
+    )
+
+    batch = _batch([episode])
+
+    assert batch.completed_episodes == 1
+
+
+@pytest.mark.parametrize(
+    ("step", "summary_count"),
+    [
+        (_fallback_step(), 0),
+        (_step(), 1),
+    ],
+)
+def test_ok_episode_requires_exact_trace_fallback_counts(
+    step: StepRecord,
+    summary_count: int,
+) -> None:
+    episode = replace(
+        _episode(0, step_records=[step]),
+        parse_failures=summary_count,
+    )
+
+    with pytest.raises(ValueError, match="parse_failures.*trace"):
+        _batch([episode])
+
+
+def test_error_episode_rejects_trace_fallback_above_summary() -> None:
+    episode = _episode(
+        0,
+        status="error",
+        step_records=[_fallback_step()],
+    )
+
+    with pytest.raises(ValueError, match="parse_failures.*trace"):
+        _batch([episode])
+
+
+def test_error_episode_accepts_one_untraced_fallback_after_trace() -> None:
+    episode = replace(
+        _episode(
+            0,
+            status="error",
+            step_records=[_fallback_step()],
+        ),
+        parse_failures=2,
+    )
+
+    batch = _batch([episode])
+
+    assert batch.error_episodes == 1
 
 
 def test_aggregate_rejects_fallback_counter_overflow() -> None:
@@ -488,6 +631,16 @@ def test_write_outputs_rejects_batch_result_seed_inconsistency(
         write_outputs(tmp_path, batch, results, config={})
 
 
+def test_write_outputs_rejects_invalid_batch_metadata(
+    tmp_path: Path,
+) -> None:
+    results = [_episode(0)]
+    batch = replace(_batch(results), model=" ")
+
+    with pytest.raises(ValueError, match="model.*non-empty string"):
+        write_outputs(tmp_path, batch, results, config={})
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -634,3 +787,74 @@ def test_write_outputs_publishes_over_existing_empty_directory(
         "results.json",
     ]
     assert json.loads((out / "config.json").read_text()) == {"seed": 0}
+
+
+def test_write_outputs_fsyncs_directories_in_publication_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from world2skills.evaluation import metrics
+
+    results = [_episode(0, step_records=[_step()])]
+    out = tmp_path / "run"
+    events: list[tuple[str, str]] = []
+    real_write = metrics._write_staged_file
+    real_replace = metrics.os.replace
+
+    def tracked_write(path: Path, text: str) -> None:
+        events.append(("write", path.name))
+        real_write(path, text)
+
+    def tracked_fsync(path: Path) -> None:
+        events.append(("fsync", path.name))
+
+    def tracked_replace(source: object, destination: object) -> None:
+        events.append(("replace", Path(destination).name))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(metrics, "_write_staged_file", tracked_write)
+    monkeypatch.setattr(
+        metrics,
+        "_fsync_directory",
+        tracked_fsync,
+        raising=False,
+    )
+    monkeypatch.setattr(metrics.os, "replace", tracked_replace)
+
+    write_outputs(out, _batch(results), results, config={})
+
+    assert events == [
+        ("write", "results.json"),
+        ("write", "config.json"),
+        ("write", "episode_0.jsonl"),
+        ("fsync", events[3][1]),
+        ("replace", "run"),
+        ("fsync", tmp_path.name),
+    ]
+    assert events[3][1].startswith(".run.staging-")
+
+
+def test_staging_directory_fsync_failure_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from world2skills.evaluation import metrics
+
+    results = [_episode(0)]
+    out = tmp_path / "run"
+
+    def fail_fsync(path: Path) -> None:
+        raise OSError(f"fsync failed: {path.name}")
+
+    monkeypatch.setattr(
+        metrics,
+        "_fsync_directory",
+        fail_fsync,
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="fsync failed"):
+        write_outputs(out, _batch(results), results, config={})
+
+    assert not out.exists()
+    assert list(tmp_path.glob(".run.staging-*")) == []
