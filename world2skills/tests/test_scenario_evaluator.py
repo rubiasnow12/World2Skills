@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 
 from gymnasium.spaces import Discrete
 import numpy as np
@@ -9,6 +10,7 @@ import pytest
 pytest.importorskip("highway_env")
 
 from highway_env.vehicle.behavior import IDMVehicle
+from highway_env.vehicle.kinematics import Vehicle
 
 from world2skills.runtime.env_factory import make_env
 from world2skills.runtime.scenario import (
@@ -138,9 +140,61 @@ def test_configure_and_snapshot_expose_resolved_m1_parameters() -> None:
         "target_lane_front_clearance_m": 24.0,
         "target_lane_rear_clearance_m": 22.0,
         "spawn_gap": 36.0,
+        "min_lane_gap_m": 20.0,
+        "minimum_spawn_clearance_m": 25.0,
         "target_speed_mps": 25.0,
         "environment_config": scenario.configure(),
     }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, -1, None, True, "20", float("nan"), float("inf")],
+)
+def test_scenario_requires_positive_skill_min_lane_gap(value: object) -> None:
+    card = deepcopy(load_skill("lane-change-overtake"))
+    card.parameters["min_lane_gap"]["default"] = value
+
+    with pytest.raises(ValueError, match="min_lane_gap.default"):
+        LaneChangeOvertakeScenario(card)
+
+
+def test_scenario_rejects_spawn_gap_below_minimum_bumper_clearance() -> None:
+    card = load_skill("lane-change-overtake")
+    minimum = 20.0 + Vehicle.LENGTH
+
+    with pytest.raises(ValueError, match=r"spawn_gap.*25\.0"):
+        LaneChangeOvertakeScenario(card, spawn_gap=minimum - 0.01)
+
+
+def test_scenario_accepts_exact_minimum_bumper_clearance() -> None:
+    card = load_skill("lane-change-overtake")
+    minimum = 20.0 + Vehicle.LENGTH
+
+    scenario = LaneChangeOvertakeScenario(card, spawn_gap=minimum)
+
+    assert scenario.min_lane_gap_m == 20.0
+    assert scenario.minimum_spawn_clearance_m == 25.0
+    assert scenario.spawn_gap == scenario.minimum_spawn_clearance_m
+
+
+def test_reset_revalidates_spawn_gap_with_actual_vehicle_lengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    card = load_skill("lane-change-overtake")
+    minimum = 20.0 + Vehicle.LENGTH
+    scenario = LaneChangeOvertakeScenario(card, spawn_gap=minimum)
+    grounding = select_grounding(card, "highway-env")
+    env, _ = make_env(grounding, scenario.configure(), seed=0)
+    monkeypatch.setattr(IDMVehicle, "LENGTH", 9.0)
+    try:
+        with pytest.raises(
+            ScenarioSetupError,
+            match="actual vehicle lengths",
+        ):
+            scenario.reset(env, seed=0)
+    finally:
+        env.close()
 
 
 @pytest.mark.parametrize(
@@ -187,6 +241,8 @@ def test_reset_establishes_exact_comparable_geometry_and_reseeds_actions(
         )
         assert scenario.initial_ego_lane[2] == 1
         assert scenario.target_lane[2] == 0
+        assert scenario.env_unwrapped is u
+        assert scenario.road is u.road
         assert scenario.ego_vehicle is ego
         assert scenario.reference_lane is initial_lane
         assert scenario.initial_lead_vehicle in u.road.vehicles
@@ -356,6 +412,79 @@ def test_reset_rejects_environment_with_fewer_than_two_lanes() -> None:
         env.close()
 
 
+def _invoke_env_coupled_method(
+    scenario: LaneChangeOvertakeScenario,
+    env: object,
+    method: str,
+) -> object:
+    if method == "validate_preconditions":
+        return scenario.validate_preconditions(env)
+    if method == "update":
+        return scenario.update(env, t=0)
+    if method == "build_context":
+        return scenario.build_context(
+            env,
+            prev_primitive=None,
+            available_primitives=["maintain-speed"],
+        )
+    if method == "is_terminal":
+        return scenario.is_terminal(env)
+    raise AssertionError(f"unknown method: {method}")
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["validate_preconditions", "update", "build_context", "is_terminal"],
+)
+def test_env_coupled_methods_reject_a_different_environment(method: str) -> None:
+    scenario, bound_env, _ = _make_scenario_env(seed=0)
+    _, other_env, _ = _make_scenario_env(seed=1)
+    try:
+        scenario.reset(bound_env, seed=0)
+
+        with pytest.raises(ScenarioSetupError, match="different environment"):
+            _invoke_env_coupled_method(scenario, other_env, method)
+    finally:
+        bound_env.close()
+        other_env.close()
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["validate_preconditions", "update", "build_context", "is_terminal"],
+)
+def test_env_coupled_methods_reject_external_environment_reset(
+    method: str,
+) -> None:
+    scenario, env, _ = _make_scenario_env(seed=0)
+    try:
+        scenario.reset(env, seed=0)
+        env.reset(seed=0)
+
+        with pytest.raises(ScenarioSetupError, match="externally reset"):
+            _invoke_env_coupled_method(scenario, env, method)
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["validate_preconditions", "update", "build_context", "is_terminal"],
+)
+def test_env_coupled_methods_require_bound_lead_membership(
+    method: str,
+) -> None:
+    scenario, env, _ = _make_scenario_env(seed=0)
+    try:
+        scenario.reset(env, seed=0)
+        env.unwrapped.road.vehicles.remove(scenario.initial_lead_vehicle)
+
+        with pytest.raises(ScenarioSetupError, match="bound lead.*road"):
+            _invoke_env_coupled_method(scenario, env, method)
+    finally:
+        env.close()
+
+
 def test_build_context_reports_stable_target_relation_and_side_gap_signs() -> None:
     scenario, env, _ = _make_scenario_env(seed=0)
     try:
@@ -407,9 +536,69 @@ def test_build_context_reports_stable_target_relation_and_side_gap_signs() -> No
         assert context.left_rear_gap_m is None
         assert context.left_rear_closing_speed_mps is None
         assert context.right_lane_exists is True
-        assert context.right_front_gap_m == pytest.approx(40.0)
-        assert context.right_rear_gap_m == pytest.approx(15.0)
+        assert context.right_front_gap_m == pytest.approx(35.0)
+        assert context.right_rear_gap_m == pytest.approx(10.0)
         assert context.right_rear_closing_speed_mps == pytest.approx(5.0)
+    finally:
+        env.close()
+
+
+def test_side_gaps_use_vehicle_lengths_and_clamp_overlap_to_zero() -> None:
+    scenario, env, _ = _make_scenario_env(seed=0)
+    try:
+        scenario.reset(env, seed=0)
+        u = env.unwrapped
+        ego = u.vehicle
+        u.road.vehicles = [ego, scenario.initial_lead_vehicle]
+        right_lane_index = (
+            scenario.initial_ego_lane[0],
+            scenario.initial_ego_lane[1],
+            scenario.initial_ego_lane[2] + 1,
+        )
+        right_lane = u.road.network.get_lane(right_lane_index)
+        ego_s = float(right_lane.local_coordinates(ego.position)[0])
+        front = IDMVehicle.make_on_lane(
+            u.road,
+            right_lane_index,
+            ego_s + 12.0,
+            speed=10.0,
+        )
+        rear = IDMVehicle.make_on_lane(
+            u.road,
+            right_lane_index,
+            ego_s - 8.0,
+            speed=float(ego.speed) + 7.0,
+        )
+        front.enable_lane_change = rear.enable_lane_change = False
+        u.road.vehicles.extend([front, rear])
+
+        context = scenario.build_context(
+            env,
+            prev_primitive=None,
+            available_primitives=["maintain-speed"],
+        )
+
+        assert context.right_front_gap_m == pytest.approx(
+            12.0 - (ego.LENGTH + front.LENGTH) / 2
+        )
+        assert context.right_rear_gap_m == pytest.approx(
+            8.0 - (ego.LENGTH + rear.LENGTH) / 2
+        )
+        assert context.right_rear_closing_speed_mps == pytest.approx(7.0)
+
+        front.position = right_lane.position(ego_s + 4.0, 0)
+        rear.position = right_lane.position(ego_s - 4.0, 0)
+        front.on_state_update()
+        rear.on_state_update()
+        overlapping = scenario.build_context(
+            env,
+            prev_primitive=None,
+            available_primitives=["maintain-speed"],
+        )
+
+        assert overlapping.right_front_gap_m == 0.0
+        assert overlapping.right_rear_gap_m == 0.0
+        assert overlapping.right_rear_closing_speed_mps == pytest.approx(7.0)
     finally:
         env.close()
 
@@ -460,7 +649,14 @@ def test_update_tracks_first_causal_steps_and_collision_is_sticky() -> None:
 def test_scripted_oracle_completes_causal_overtake_without_collision(
     seed: int,
 ) -> None:
-    scenario, env, name_to_index = _make_scenario_env(seed)
+    minimum_spawn_gap = (
+        load_skill("lane-change-overtake").parameters["min_lane_gap"]["default"]
+        + Vehicle.LENGTH
+    )
+    scenario, env, name_to_index = _make_scenario_env(
+        seed,
+        spawn_gap=minimum_spawn_gap,
+    )
     try:
         scenario.reset(env, seed)
         terminated = truncated = False

@@ -79,6 +79,21 @@ class LaneChangeOvertakeScenario:
         )
         self.spawn_gap = self._positive(spawn_gap, "spawn_gap")
         self.target_speed_mps = self._target_speed(skill_card)
+        self.min_lane_gap_m = self._skill_positive_parameter(
+            skill_card,
+            "min_lane_gap",
+        )
+        from highway_env.vehicle.kinematics import Vehicle
+
+        self.minimum_spawn_clearance_m = (
+            self.min_lane_gap_m + float(Vehicle.LENGTH)
+        )
+        if self.spawn_gap < self.minimum_spawn_clearance_m:
+            raise ValueError(
+                "spawn_gap must be at least "
+                f"{self.minimum_spawn_clearance_m:.1f} m to preserve "
+                "min_lane_gap.default bumper clearance"
+            )
         self._reset_state()
 
     @staticmethod
@@ -101,15 +116,25 @@ class LaneChangeOvertakeScenario:
 
     @classmethod
     def _target_speed(cls, skill_card: SkillCard) -> float:
+        return cls._skill_positive_parameter(skill_card, "target_speed")
+
+    @classmethod
+    def _skill_positive_parameter(
+        cls,
+        skill_card: SkillCard,
+        parameter_name: str,
+    ) -> float:
         try:
-            value = skill_card.parameters["target_speed"]["default"]
+            value = skill_card.parameters[parameter_name]["default"]
         except (KeyError, TypeError) as exc:
             raise ValueError(
-                "skill target_speed.default must be configured"
+                f"skill {parameter_name}.default must be configured"
             ) from exc
-        return cls._positive(value, "target_speed.default")
+        return cls._positive(value, f"{parameter_name}.default")
 
     def _reset_state(self) -> None:
+        self.env_unwrapped: Any | None = None
+        self.road: Any | None = None
         self.ego_vehicle: Any | None = None
         self.initial_ego_lane: tuple[str, str, int] | None = None
         self.reference_lane: Any | None = None
@@ -151,19 +176,38 @@ class LaneChangeOvertakeScenario:
                 self.target_lane_rear_clearance_m
             ),
             "spawn_gap": self.spawn_gap,
+            "min_lane_gap_m": self.min_lane_gap_m,
+            "minimum_spawn_clearance_m": self.minimum_spawn_clearance_m,
             "target_speed_mps": self.target_speed_mps,
             "environment_config": deepcopy(self.configure()),
         }
 
     def _require_initialized(self) -> None:
         if (
-            self.ego_vehicle is None
+            self.env_unwrapped is None
+            or self.road is None
+            or self.ego_vehicle is None
             or self.initial_ego_lane is None
             or self.target_lane is None
             or self.initial_lead_vehicle is None
             or self.reference_lane is None
         ):
             raise ScenarioSetupError("scenario has not been reset")
+
+    def _require_owned_env(self, env: Any) -> Any:
+        self._require_initialized()
+        u = env.unwrapped
+        if u is not self.env_unwrapped:
+            raise ScenarioSetupError(
+                "scenario received a different environment than the one reset"
+            )
+        if u.road is not self.road or u.vehicle is not self.ego_vehicle:
+            raise ScenarioSetupError(
+                "bound environment was externally reset after scenario setup"
+            )
+        if self.initial_lead_vehicle not in self.road.vehicles:
+            raise ScenarioSetupError("bound lead vehicle is not on the road")
+        return u
 
     def _longitudinal(self, position: Any) -> float:
         if self.reference_lane is None:
@@ -209,6 +253,8 @@ class LaneChangeOvertakeScenario:
         if lane_count < 2:
             raise ScenarioSetupError("overtake scenario requires at least 2 lanes")
 
+        self.env_unwrapped = u
+        self.road = u.road
         self.ego_vehicle = ego
         self.initial_ego_lane = tuple(ego.lane_index)
         self.reference_lane = u.road.network.get_lane(self.initial_ego_lane)
@@ -271,8 +317,7 @@ class LaneChangeOvertakeScenario:
     def validate_preconditions(self, env: Any) -> None:
         """Recompute and validate every scene invariant required by M1."""
 
-        self._require_initialized()
-        u = env.unwrapped
+        u = self._require_owned_env(env)
         ego = u.vehicle
         road = u.road
         lane_indexes = road.network.all_side_lanes(self.initial_ego_lane)
@@ -284,7 +329,7 @@ class LaneChangeOvertakeScenario:
             raise ScenarioSetupError("target lane is not adjacent to initial lane")
 
         lead = self.initial_lead_vehicle
-        if lead not in road.vehicles or not lead.on_road:
+        if not lead.on_road:
             raise ScenarioSetupError("bound lead vehicle is not on the road")
         if lead.lane_index != self.initial_ego_lane or not self._lane_contains(
             self.reference_lane,
@@ -297,6 +342,16 @@ class LaneChangeOvertakeScenario:
         gap = lead_longitudinal - ego_longitudinal
         if gap <= 0:
             raise ScenarioSetupError("bound lead vehicle must be ahead of ego")
+        actual_minimum_spawn_clearance = (
+            self.min_lane_gap_m
+            + float(ego.LENGTH) / 2
+            + float(lead.LENGTH) / 2
+        )
+        if gap < actual_minimum_spawn_clearance:
+            raise ScenarioSetupError(
+                "spawn_gap is unsafe for actual vehicle lengths: "
+                f"requires at least {actual_minimum_spawn_clearance:.1f} m"
+            )
         tolerance = max(1e-8, self.spawn_gap * 1e-8)
         if not math.isclose(gap, self.spawn_gap, abs_tol=tolerance):
             raise ScenarioSetupError(
@@ -361,10 +416,9 @@ class LaneChangeOvertakeScenario:
     def update(self, env: Any, t: int) -> None:
         """Record first causal milestones using the initial lane reference axis."""
 
-        self._require_initialized()
         if type(t) is not int or t < 0:
             raise ValueError("t must be a nonnegative integer")
-        u = env.unwrapped
+        u = self._require_owned_env(env)
         ego = u.vehicle
         self.collision = self.collision or bool(ego.crashed)
 
@@ -385,7 +439,9 @@ class LaneChangeOvertakeScenario:
     def is_terminal(self, env: Any | None = None) -> tuple[bool, str]:
         """Return terminal only for scenario success, never for Gym termination."""
 
-        success, _ = self.evaluate(env)
+        if env is not None:
+            self._require_owned_env(env)
+        success, _ = self.evaluate()
         return (True, "success") if success else (False, "")
 
     def evaluate(self, env: Any | None = None) -> tuple[bool, str]:
@@ -412,14 +468,22 @@ class LaneChangeOvertakeScenario:
         ego_longitudinal = float(lane.local_coordinates(ego.position)[0])
         front, rear = u.road.neighbour_vehicles(ego, lane_index)
         front_gap = (
-            float(lane.local_coordinates(front.position)[0])
-            - ego_longitudinal
+            max(
+                0.0,
+                float(lane.local_coordinates(front.position)[0])
+                - ego_longitudinal
+                - (float(ego.LENGTH) + float(front.LENGTH)) / 2,
+            )
             if front is not None
             else None
         )
         rear_gap = (
-            ego_longitudinal
-            - float(lane.local_coordinates(rear.position)[0])
+            max(
+                0.0,
+                ego_longitudinal
+                - float(lane.local_coordinates(rear.position)[0])
+                - (float(ego.LENGTH) + float(rear.LENGTH)) / 2,
+            )
             if rear is not None
             else None
         )
@@ -453,15 +517,12 @@ class LaneChangeOvertakeScenario:
     ) -> ObservationContext:
         """Build a validated target/side-lane context for observation rendering."""
 
-        self._require_initialized()
         if prev_primitive is not None and (
             not isinstance(prev_primitive, str) or not prev_primitive.strip()
         ):
             raise ValueError("prev_primitive must be None or a non-empty string")
-        u = env.unwrapped
+        u = self._require_owned_env(env)
         ego = u.vehicle
-        if self.initial_lead_vehicle not in u.road.vehicles:
-            raise ScenarioSetupError("bound lead vehicle is not on the road")
 
         lane_indexes = u.road.network.all_side_lanes(ego.lane_index)
         lane_ids = {lane_index[2] for lane_index in lane_indexes}
