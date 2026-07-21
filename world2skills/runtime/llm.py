@@ -53,7 +53,10 @@ class ModelSettings:
         if self.max_tokens is not None:
             settings["max_output_tokens"] = self.max_tokens
         if self.extra_body:
-            settings["extra_body"] = copy.deepcopy(self.extra_body)
+            extra_body = copy.deepcopy(self.extra_body)
+            extra_body.pop("seed", None)
+            if extra_body:
+                settings["extra_body"] = extra_body
         return settings
 
 

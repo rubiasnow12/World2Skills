@@ -280,6 +280,55 @@ def test_azure_responses_sends_effective_settings_and_endpoint_identity():
     assert result.request_hash == expected_hash
 
 
+def test_azure_responses_drops_seed_before_hashing_and_provider_call():
+    provider = FakeOpenAIProvider(
+        response_outcomes=[_responses_response("maintain-speed")]
+    )
+    client = AzureResponsesClient(
+        model="gpt-5.4",
+        api_key="test-key",
+        base_url="http://127.0.0.1:8765/openai/",
+        api_version="2026-06-01-preview",
+        use_cache=False,
+        retry_delays=(),
+        client_factory=RecordingFactory(provider),
+    )
+    settings = ModelSettings(
+        temperature=0.1,
+        max_tokens=32,
+        extra_body={"seed": 1234, "reasoning_effort": "low"},
+    )
+
+    result = client.chat(MESSAGES, settings, prompt_version="pv")
+
+    effective_settings = {
+        "temperature": 0.1,
+        "max_output_tokens": 32,
+        "extra_body": {"reasoning_effort": "low"},
+    }
+    assert client._effective_settings(settings) == effective_settings
+    assert provider.responses_create.calls == [
+        {
+            "model": "gpt-5.4",
+            "input": [
+                {"role": "system", "content": "Choose one primitive."},
+                {"role": "user", "content": "Ego lane: 1"},
+            ],
+            **effective_settings,
+        }
+    ]
+    assert result.request_hash == make_request_hash(
+        client_type="AzureResponsesClient",
+        model="gpt-5.4",
+        api_type="azure-responses",
+        base_url="http://127.0.0.1:8765/openai/",
+        api_version="2026-06-01-preview",
+        effective_settings=effective_settings,
+        messages=MESSAGES,
+        prompt_version="pv",
+    )
+
+
 @pytest.mark.parametrize(
     "error_factory",
     [
