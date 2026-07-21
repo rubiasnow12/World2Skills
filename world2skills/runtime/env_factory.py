@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from importlib import metadata
+import math
+from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -19,6 +21,12 @@ _ACTION_TYPE = "DiscreteMetaAction"
 _OBSERVATION_TYPE = "Kinematics"
 _DEFAULT_OBS_VEHICLES_COUNT = 8
 _RENDERER_REQUIRED_FEATURES = ("presence", "x", "y", "vx", "vy")
+_RESERVED_SCENARIO_KEYS = frozenset({"observation", "action"})
+_POSITIVE_NUMBER_FIELDS = (
+    "duration",
+    "policy_frequency",
+    "simulation_frequency",
+)
 
 
 def _validate_grounding(grounding: Grounding) -> list[str]:
@@ -92,17 +100,30 @@ def _validate_grounding(grounding: Grounding) -> list[str]:
 def _resolved_config(
     scenario_config: dict[str, Any],
     features: list[str],
+    default_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     if not isinstance(scenario_config, dict):
         raise TypeError("scenario_config must be a dict")
 
     config = deepcopy(scenario_config)
+    reserved = sorted(_RESERVED_SCENARIO_KEYS.intersection(config))
+    if reserved:
+        raise ValueError(
+            f"scenario_config cannot override reserved keys: {reserved}"
+        )
+
     obs_vehicles_count = config.pop(
         "obs_vehicles_count",
         _DEFAULT_OBS_VEHICLES_COUNT,
     )
     if type(obs_vehicles_count) is not int or obs_vehicles_count <= 0:
         raise ValueError("obs_vehicles_count must be a positive integer")
+
+    unknown = sorted(set(config) - set(default_config))
+    if unknown:
+        raise ValueError(f"unknown scenario_config keys: {unknown}")
+
+    _validate_core_scenario_values(config, default_config)
 
     config["observation"] = {
         "type": _OBSERVATION_TYPE,
@@ -115,6 +136,56 @@ def _resolved_config(
     }
     config["action"] = {"type": _ACTION_TYPE}
     return config
+
+
+def _validate_core_scenario_values(
+    config: Mapping[str, Any],
+    default_config: Mapping[str, Any],
+) -> None:
+    if "lanes_count" in config:
+        lanes_count = config["lanes_count"]
+        if type(lanes_count) is not int or lanes_count < 2:
+            raise ValueError("lanes_count must be an integer greater than or equal to 2")
+
+    if "vehicles_count" in config:
+        vehicles_count = config["vehicles_count"]
+        if type(vehicles_count) is not int or vehicles_count < 0:
+            raise ValueError("vehicles_count must be a nonnegative integer")
+
+    if "controlled_vehicles" in config:
+        controlled_vehicles = config["controlled_vehicles"]
+        if type(controlled_vehicles) is not int or controlled_vehicles <= 0:
+            raise ValueError("controlled_vehicles must be a positive integer")
+
+    for field in _POSITIVE_NUMBER_FIELDS:
+        if field not in config:
+            continue
+        value = config[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{field} must be a positive finite number")
+
+    policy_frequency = config.get(
+        "policy_frequency",
+        default_config.get("policy_frequency"),
+    )
+    simulation_frequency = config.get(
+        "simulation_frequency",
+        default_config.get("simulation_frequency"),
+    )
+    if (
+        policy_frequency is not None
+        and simulation_frequency is not None
+        and simulation_frequency < policy_frequency
+    ):
+        raise ValueError(
+            "simulation_frequency must be greater than or equal to "
+            "policy_frequency"
+        )
 
 
 def _invert_action_map(env: Any) -> dict[str, int]:
@@ -186,7 +257,6 @@ def make_env(
     """Return a configured, reset environment and its action-name index map."""
 
     features = _validate_grounding(grounding)
-    config = _resolved_config(scenario_config, features)
 
     import gymnasium
     import highway_env  # noqa: F401 - import registers highway-env IDs
@@ -195,9 +265,17 @@ def make_env(
     try:
         env = gymnasium.make(
             grounding.environment,
-            config=config,
             render_mode=None,
         )
+        default_config = env.unwrapped.default_config()
+        if not isinstance(default_config, Mapping):
+            raise ValueError("highway-env default_config() must return a mapping")
+        config = _resolved_config(
+            scenario_config,
+            features,
+            default_config,
+        )
+        env.unwrapped.configure(config)
         obs, _ = env.reset(seed=seed)
         # This seeds only the action space created by the factory's initial reset.
         env.action_space.seed(seed)

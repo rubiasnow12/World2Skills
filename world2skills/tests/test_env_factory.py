@@ -37,6 +37,57 @@ def scenario_config() -> dict[str, Any]:
     }
 
 
+class _TrackingEnv:
+    def __init__(self, reset_error: Exception | None = None) -> None:
+        self.unwrapped = self
+        self.closed = False
+        self.configured_with: dict[str, Any] | None = None
+        self.reset_error = reset_error
+
+    def default_config(self) -> dict[str, Any]:
+        return {
+            "observation": {},
+            "action": {},
+            "lanes_count": 4,
+            "vehicles_count": 50,
+            "duration": 40,
+            "policy_frequency": 1,
+            "simulation_frequency": 15,
+            "controlled_vehicles": 1,
+        }
+
+    def configure(self, config: dict[str, Any]) -> None:
+        self.configured_with = deepcopy(config)
+
+    def reset(self, *, seed: int) -> None:
+        if self.reset_error is not None:
+            raise self.reset_error
+        raise AssertionError(f"reset should not be called for seed {seed}")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _patch_make(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    *,
+    reset_error: Exception | None = None,
+) -> tuple[_TrackingEnv, dict[str, Any]]:
+    import gymnasium
+
+    fake_env = _TrackingEnv(reset_error)
+    make_kwargs: dict[str, Any] = {}
+
+    def fake_make(environment: str, **kwargs: Any) -> _TrackingEnv:
+        assert environment == grounding.environment
+        make_kwargs.update(kwargs)
+        return fake_env
+
+    monkeypatch.setattr(gymnasium, "make", fake_make)
+    return fake_env, make_kwargs
+
+
 def test_make_env_returns_resolved_kinematics_config_and_action_map(
     grounding: Grounding,
     scenario_config: dict[str, Any],
@@ -186,14 +237,129 @@ def test_make_env_requires_all_renderer_kinematics_features(
 
 @pytest.mark.parametrize("value", [0, -1, 1.5, True, None, "8"])
 def test_make_env_rejects_non_positive_integer_observation_count(
+    monkeypatch: pytest.MonkeyPatch,
     grounding: Grounding,
     scenario_config: dict[str, Any],
     value: object,
 ) -> None:
     scenario_config["obs_vehicles_count"] = value
+    fake_env, _ = _patch_make(monkeypatch, grounding)
 
     with pytest.raises(ValueError, match="obs_vehicles_count"):
         make_env(grounding, scenario_config, seed=0)
+
+    assert fake_env.closed is True
+    assert fake_env.configured_with is None
+
+
+def test_make_env_rejects_unknown_scenario_key_and_closes_env(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    scenario_config["vehcles_count"] = scenario_config["vehicles_count"]
+    config_before = deepcopy(scenario_config)
+    fake_env, _ = _patch_make(monkeypatch, grounding)
+
+    with pytest.raises(ValueError, match="vehcles_count"):
+        make_env(grounding, scenario_config, seed=0)
+
+    assert fake_env.closed is True
+    assert fake_env.configured_with is None
+    assert scenario_config == config_before
+
+
+@pytest.mark.parametrize("reserved_key", ["observation", "action"])
+def test_make_env_rejects_caller_supplied_reserved_config_and_closes_env(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+    reserved_key: str,
+) -> None:
+    scenario_config[reserved_key] = {"type": "CallerOverride"}
+    fake_env, _ = _patch_make(monkeypatch, grounding)
+
+    with pytest.raises(ValueError, match=reserved_key):
+        make_env(grounding, scenario_config, seed=0)
+
+    assert fake_env.closed is True
+    assert fake_env.configured_with is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("lanes_count", 1),
+        ("lanes_count", 0),
+        ("lanes_count", -1),
+        ("lanes_count", True),
+        ("lanes_count", 2.0),
+        ("vehicles_count", -1),
+        ("vehicles_count", True),
+        ("vehicles_count", 1.0),
+        ("duration", 0),
+        ("duration", -1),
+        ("duration", True),
+        ("duration", float("nan")),
+        ("duration", float("inf")),
+        ("policy_frequency", 0),
+        ("policy_frequency", -1),
+        ("policy_frequency", True),
+        ("policy_frequency", float("nan")),
+        ("simulation_frequency", 0),
+        ("simulation_frequency", -1),
+        ("simulation_frequency", True),
+        ("simulation_frequency", float("inf")),
+        ("controlled_vehicles", 0),
+        ("controlled_vehicles", -1),
+        ("controlled_vehicles", True),
+        ("controlled_vehicles", 1.0),
+    ],
+)
+def test_make_env_rejects_invalid_core_scenario_value_and_closes_env(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+    field: str,
+    value: object,
+) -> None:
+    scenario_config[field] = value
+    fake_env, _ = _patch_make(monkeypatch, grounding)
+
+    with pytest.raises(ValueError, match=field):
+        make_env(grounding, scenario_config, seed=0)
+
+    assert fake_env.closed is True
+    assert fake_env.configured_with is None
+
+
+def test_make_env_rejects_simulation_frequency_below_policy_frequency(
+    monkeypatch: pytest.MonkeyPatch,
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    scenario_config["policy_frequency"] = 10
+    scenario_config["simulation_frequency"] = 5
+    fake_env, _ = _patch_make(monkeypatch, grounding)
+
+    with pytest.raises(
+        ValueError,
+        match="simulation_frequency.*policy_frequency",
+    ):
+        make_env(grounding, scenario_config, seed=0)
+
+    assert fake_env.closed is True
+    assert fake_env.configured_with is None
+
+
+def test_make_env_allows_zero_other_vehicles(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    scenario_config["vehicles_count"] = 0
+
+    env, _ = make_env(grounding, scenario_config, seed=0)
+    env.close()
 
 
 def test_make_env_rejects_missing_backend_action_label(
@@ -211,32 +377,17 @@ def test_make_env_closes_created_env_when_initialization_fails(
     grounding: Grounding,
     scenario_config: dict[str, Any],
 ) -> None:
-    import gymnasium
-
-    class FailingEnv:
-        def __init__(self) -> None:
-            self.closed = False
-
-        def reset(self, *, seed: int) -> None:
-            raise RuntimeError(f"reset failed for seed {seed}")
-
-        def close(self) -> None:
-            self.closed = True
-
-    fake_env = FailingEnv()
-    make_kwargs: dict[str, Any] = {}
-
-    def fake_make(environment: str, **kwargs: Any) -> FailingEnv:
-        assert environment == grounding.environment
-        make_kwargs.update(kwargs)
-        return fake_env
-
-    monkeypatch.setattr(gymnasium, "make", fake_make)
+    fake_env, make_kwargs = _patch_make(
+        monkeypatch,
+        grounding,
+        reset_error=RuntimeError("reset failed"),
+    )
 
     with pytest.raises(RuntimeError, match="reset failed"):
         make_env(grounding, scenario_config, seed=23)
 
     assert fake_env.closed is True
-    assert make_kwargs["render_mode"] is None
-    assert make_kwargs["config"]["observation"]["normalize"] is False
-    assert make_kwargs["config"]["action"] == {"type": "DiscreteMetaAction"}
+    assert make_kwargs == {"render_mode": None}
+    assert fake_env.configured_with is not None
+    assert fake_env.configured_with["observation"]["normalize"] is False
+    assert fake_env.configured_with["action"] == {"type": "DiscreteMetaAction"}
