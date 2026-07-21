@@ -12,6 +12,8 @@ from world2skills.runtime.executor import (
 from world2skills.runtime.llm import (
     LLMRequestError,
     MockLLMClient,
+    ModelSettings,
+    make_request_hash,
 )
 from world2skills.runtime.skill_loader import load_skill, select_grounding
 from world2skills.runtime.types import ObservationContext
@@ -129,8 +131,18 @@ def test_malformed_unknown_or_non_exact_reply_uses_parse_fallback(reply: str):
     assert result.fallback_reason
 
 
-def test_non_string_reply_uses_controlled_parse_fallback():
-    result = _executor(None).decide(
+@pytest.mark.parametrize(
+    ("reply", "expected_raw_response"),
+    [
+        (None, "null"),
+        ({"z": 1, "a": 2}, '{"a":2,"z":1}'),
+    ],
+)
+def test_non_string_reply_is_normalized_before_parse_fallback(
+    reply: Any,
+    expected_raw_response: str,
+):
+    result = _executor(reply).decide(
         "observation",
         None,
         ALL_PRIMITIVES,
@@ -138,8 +150,9 @@ def test_non_string_reply_uses_controlled_parse_fallback():
 
     assert result.decision_status == "parse_fallback"
     assert result.primitive == "maintain-speed"
-    assert result.raw_response is None
-    assert result.fallback_reason == "response must be a string"
+    assert result.raw_response == expected_raw_response
+    assert isinstance(result.raw_response, str)
+    assert result.fallback_reason
 
 
 def test_valid_but_unavailable_primitive_uses_unavailable_fallback():
@@ -450,8 +463,20 @@ def test_constructor_deep_snapshots_skill_card_and_grounding():
 
 
 class RaisingClient:
-    def __init__(self, error: Exception):
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        model: str = "failing-model",
+        api_type: str = "test-api",
+        base_url: str = "https://executor.test/v1",
+        api_version: str = "2026-07-21",
+    ):
         self.error = error
+        self.model = model
+        self.api_type = api_type
+        self.base_url = base_url
+        self.api_version = api_version
 
     def chat(self, *_args, **_kwargs):
         raise self.error
@@ -480,17 +505,32 @@ def test_llm_request_error_preserves_trace_identity_and_original_error():
     assert result.fallback_reason == "TimeoutError: provider timed out"
 
 
-def test_generic_client_error_propagates_without_silent_fallback():
-    executor = _executor(
-        client=RaisingClient(RuntimeError("provider exploded"))
+def test_generic_client_error_uses_local_audit_hash_and_fallback():
+    client = RaisingClient(RuntimeError("provider exploded"))
+    executor = _executor(client=client)
+    allowed = ["accelerate"]
+    messages = executor.build_messages("observation", allowed)
+    expected_hash = make_request_hash(
+        client_type="RaisingClient",
+        model=client.model,
+        api_type=client.api_type,
+        base_url=client.base_url,
+        api_version=client.api_version,
+        effective_settings=ModelSettings().for_chat_completions(),
+        messages=messages,
+        prompt_version="lco-v1",
     )
 
-    with pytest.raises(RuntimeError, match="provider exploded"):
-        executor.decide(
-            "observation",
-            None,
-            ["accelerate"],
-        )
+    result = executor.decide("observation", None, allowed)
+
+    assert result.decision_status == "llm_error_fallback"
+    assert result.primitive == "accelerate"
+    assert result.request_hash == expected_hash
+    assert len(result.request_hash) == 64
+    assert result.raw_response == ""
+    assert result.cache_hit is False
+    assert result.latency_ms > 0
+    assert result.fallback_reason == "RuntimeError: provider exploded"
 
 
 class FakeActionType:

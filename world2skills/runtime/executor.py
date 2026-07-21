@@ -6,9 +6,16 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 import json
 import re
+import time
 from typing import Any
 
-from .llm import LLMClient, LLMRequestError, Message, ModelSettings
+from .llm import (
+    LLMClient,
+    LLMRequestError,
+    Message,
+    ModelSettings,
+    make_request_hash,
+)
 from .types import DecisionResult, Grounding, ObservationContext, SkillCard
 
 
@@ -240,20 +247,31 @@ class LLMSkillExecutor:
                 "no skill primitive is currently available"
             )
         messages = self.build_messages(obs_text, allowed)
+        settings = ModelSettings()
         status = "ok"
         fallback_reason: str | None = None
         raw_response = ""
-        request_hash = ""
+        request_hash = make_request_hash(
+            client_type=type(self.llm).__name__,
+            model=_client_identity(self.llm, "model"),
+            api_type=_client_identity(self.llm, "api_type"),
+            base_url=_client_identity(self.llm, "base_url"),
+            api_version=_client_identity(self.llm, "api_version"),
+            effective_settings=settings.for_chat_completions(),
+            messages=messages,
+            prompt_version=self.prompt_version,
+        )
         cache_hit = False
         latency_ms = 0.0
+        started = time.perf_counter()
 
         try:
             result = self.llm.chat(
                 messages,
-                ModelSettings(),
+                settings,
                 self.prompt_version,
             )
-            raw_response = result.reply
+            raw_response = _normalize_reply(result.reply)
             request_hash = result.request_hash
             cache_hit = result.cache_hit
             latency_ms = result.latency_ms
@@ -262,6 +280,10 @@ class LLMSkillExecutor:
             request_hash = error.request_hash
             latency_ms = error.latency_ms
             fallback_reason = _describe_exception(error.original_exception)
+        except Exception as error:
+            status = "llm_error_fallback"
+            latency_ms = (time.perf_counter() - started) * 1000
+            fallback_reason = _describe_exception(error)
 
         if status == "ok":
             primitive, parse_error = self._parse_primitive(raw_response)
@@ -321,3 +343,26 @@ def _list_block(values: Sequence[str]) -> str:
 
 def _describe_exception(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
+
+
+def _client_identity(client: Any, attribute: str) -> str:
+    try:
+        value = getattr(client, attribute, "")
+    except Exception:
+        return ""
+    return "" if value is None else str(value)
+
+
+def _normalize_reply(reply: Any) -> str:
+    if isinstance(reply, str):
+        return reply
+    try:
+        return json.dumps(
+            reply,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return repr(reply)
