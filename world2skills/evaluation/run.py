@@ -83,6 +83,8 @@ _DISTRIBUTIONS = (
     "pytest",
 )
 _EGO_LANE = re.compile(r"^Ego: .* lane=(?P<lane>\d+)", re.MULTILINE)
+_DEFAULT_OBS_VEHICLES_COUNT = 8
+_REDACTED_PATH = "/%3Credacted-path%3E"
 
 
 def _nonnegative_seed(value: str) -> int:
@@ -359,9 +361,7 @@ def _sanitize_endpoint(value: object) -> str | None:
         host = f"[{hostname}]" if ":" in hostname else hostname
         if parsed.port is not None:
             host = f"{host}:{parsed.port}"
-        path = parsed.path or "/"
-        if not path.endswith("/"):
-            path = f"{path}/"
+        path = "/" if parsed.path in {"", "/"} else _REDACTED_PATH
         return urlunsplit((parsed.scheme, host, path, "", ""))
     except ValueError:
         return None
@@ -485,6 +485,42 @@ def _grounding_snapshot(grounding: Grounding) -> dict[str, Any]:
         "action": deepcopy(grounding.action),
         "primitive_map": deepcopy(grounding.primitive_map),
     }
+
+
+def _resolved_custom_environment_config(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Purely derive the custom env config passed to highway-env."""
+
+    if not isinstance(scenario_config, dict):
+        raise TypeError("scenario_config must be a dict")
+    features = grounding.observation.get("features")
+    if (
+        not isinstance(features, list)
+        or not features
+        or any(not isinstance(feature, str) or not feature for feature in features)
+    ):
+        raise ValueError("grounding observation features must be non-empty strings")
+
+    resolved = deepcopy(scenario_config)
+    vehicles_count = resolved.pop(
+        "obs_vehicles_count",
+        _DEFAULT_OBS_VEHICLES_COUNT,
+    )
+    if type(vehicles_count) is not int or vehicles_count <= 0:
+        raise ValueError("obs_vehicles_count must be a positive integer")
+    resolved["observation"] = {
+        "type": "Kinematics",
+        "features": deepcopy(features),
+        "vehicles_count": vehicles_count,
+        "normalize": False,
+        "absolute": False,
+        "see_behind": True,
+        "order": "sorted",
+    }
+    resolved["action"] = {"type": "DiscreteMetaAction"}
+    return resolved
 
 
 def _installed_versions() -> dict[str, str]:
@@ -681,6 +717,14 @@ def main(argv: list[str] | None = None) -> int:
         scenario_snapshot = _fallback_scenario_snapshot(
             card,
             config["scenario"],
+        )
+    if environment_config is None:
+        scenario_environment_config = scenario_snapshot.get("environment_config")
+        if not isinstance(scenario_environment_config, dict):
+            scenario_environment_config = LaneChangeOvertakeScenario.configure()
+        environment_config = _resolved_custom_environment_config(
+            grounding,
+            scenario_environment_config,
         )
     batch = aggregate(
         results,

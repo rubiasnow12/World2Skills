@@ -146,7 +146,8 @@ class LaneChangeOvertakeScenario:
         self.overtake_step: int | None = None
         self.collision = False
 
-    def configure(self) -> dict[str, Any]:
+    @staticmethod
+    def configure() -> dict[str, Any]:
         """Return the fixed M1 highway-v0 environment configuration."""
 
         config = {

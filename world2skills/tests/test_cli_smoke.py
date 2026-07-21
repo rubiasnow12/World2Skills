@@ -408,6 +408,159 @@ def test_client_constructor_failure_writes_one_error_per_seed(
     assert config["client"]["constructed"] is False
     assert config["client"]["construction_error"].startswith("RuntimeError:")
     assert config["client"]["model"] is None
+    environment = config["environment_config"]
+    assert environment["lanes_count"] == 4
+    assert environment["duration"] == 40
+    assert "obs_vehicles_count" not in environment
+    assert environment["observation"] == {
+        "type": "Kinematics",
+        "features": [
+            "presence",
+            "x",
+            "y",
+            "vx",
+            "vy",
+            "cos_h",
+            "sin_h",
+        ],
+        "vehicles_count": 8,
+        "normalize": False,
+        "absolute": False,
+        "see_behind": True,
+        "order": "sorted",
+    }
+    assert environment["action"] == {"type": "DiscreteMetaAction"}
+
+
+def test_all_seed_env_failures_use_deterministic_environment_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient()
+    monkeypatch.setattr(run, "_build_client", lambda model, mock: client)
+
+    def fail_make_env(
+        grounding: Any,
+        scenario_config: dict[str, Any],
+        seed: int,
+    ) -> Any:
+        del grounding, scenario_config
+        raise RuntimeError(f"env setup failed for seed {seed}")
+
+    monkeypatch.setattr(run, "make_env", fail_make_env)
+    out = tmp_path / "all-env-errors"
+
+    assert (
+        run.main(
+            [
+                "--seeds",
+                "0",
+                "1",
+                "--mock",
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+
+    results = _read_json(out / "results.json")
+    assert results["error_episodes"] == 2
+    environment = _read_json(out / "config.json")["environment_config"]
+    assert environment["controlled_vehicles"] == 1
+    assert environment["observation"]["vehicles_count"] == 8
+    assert environment["observation"]["features"][0] == "presence"
+    assert environment["action"]["type"] == "DiscreteMetaAction"
+    assert client.close_calls == 1
+
+
+def test_all_scenario_constructor_failures_still_publish_environment_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient()
+    monkeypatch.setattr(run, "_build_client", lambda model, mock: client)
+
+    def fail_scenario_init(self: Any, card: Any, **parameters: Any) -> None:
+        del self, card, parameters
+        raise RuntimeError("scenario construction failed")
+
+    monkeypatch.setattr(
+        run.LaneChangeOvertakeScenario,
+        "__init__",
+        fail_scenario_init,
+    )
+    monkeypatch.setattr(
+        run,
+        "make_env",
+        lambda *args, **kwargs: pytest.fail("make_env must not be called"),
+    )
+    out = tmp_path / "all-scenario-errors"
+
+    assert (
+        run.main(
+            [
+                "--seeds",
+                "0",
+                "1",
+                "--mock",
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+
+    results = _read_json(out / "results.json")
+    assert results["error_episodes"] == 2
+    environment = _read_json(out / "config.json")["environment_config"]
+    assert environment["lanes_count"] == 4
+    assert environment["observation"]["vehicles_count"] == 8
+    assert environment["action"] == {"type": "DiscreteMetaAction"}
+    assert client.close_calls == 1
+
+
+def test_environment_fallback_helper_is_pure_and_consumes_obs_count() -> None:
+    card = run.load_skill("lane-change-overtake")
+    grounding = run.select_grounding(card, "highway-env")
+    scenario_config = {
+        "duration": 12,
+        "policy_frequency": 2,
+        "obs_vehicles_count": 5,
+    }
+
+    resolved = run._resolved_custom_environment_config(
+        grounding,
+        scenario_config,
+    )
+
+    assert scenario_config == {
+        "duration": 12,
+        "policy_frequency": 2,
+        "obs_vehicles_count": 5,
+    }
+    assert resolved == {
+        "duration": 12,
+        "policy_frequency": 2,
+        "observation": {
+            "type": "Kinematics",
+            "features": [
+                "presence",
+                "x",
+                "y",
+                "vx",
+                "vy",
+                "cos_h",
+                "sin_h",
+            ],
+            "vehicles_count": 5,
+            "normalize": False,
+            "absolute": False,
+            "see_behind": True,
+            "order": "sorted",
+        },
+        "action": {"type": "DiscreteMetaAction"},
+    }
 
 
 def test_client_constructor_error_redacts_secret_environment_values(
@@ -474,7 +627,7 @@ def test_actual_client_identity_and_resolved_env_config_are_recorded(
     assert config["client"] == {
         "api_type": "fake-responses",
         "api_version": "2099-01-01",
-        "base_url": "https://example.test/openai/",
+        "base_url": "https://example.test/%3Credacted-path%3E",
         "close_error": None,
         "constructed": True,
         "construction_error": None,
@@ -485,6 +638,34 @@ def test_actual_client_identity_and_resolved_env_config_are_recorded(
     assert _read_json(out / "results.json")["model"] == ("azure-deployment-actual")
     assert client.close_calls == 1
     assert [env.close_calls for env in envs] == [1]
+
+
+def test_sanitize_endpoint_keeps_only_origin_and_constant_path_marker() -> None:
+    endpoint = (
+        "https://user-secret:password-secret@example.test:8443/"
+        "path-secret/nested?token=query-secret#fragment-secret"
+    )
+
+    sanitized = run._sanitize_endpoint(endpoint)
+
+    assert sanitized == "https://example.test:8443/%3Credacted-path%3E"
+    for secret in (
+        "user-secret",
+        "password-secret",
+        "path-secret",
+        "nested",
+        "query-secret",
+        "fragment-secret",
+    ):
+        assert secret not in sanitized
+
+    assert (
+        run._sanitize_endpoint(
+            "https://user-secret:password-secret@example.test:8443/"
+            "?token=query-secret#fragment-secret"
+        )
+        == "https://example.test:8443/"
+    )
 
 
 def test_client_close_failure_is_recorded_without_losing_results(
