@@ -1,0 +1,4 @@
+# Runtime deps for the World2Skills phase-2 experiment loop.
+# Pins verified 2026-07-21.
+highway-env==1.12.0
+gymnasium==1.3.0

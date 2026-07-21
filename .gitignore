@@ -5,3 +5,5 @@ vite.config.js
 vite.config.d.ts
 Trace2Skill/
 
+# World2Skills experiment run artifacts
+world2skills/outputs/
