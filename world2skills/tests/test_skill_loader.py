@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import asdict
 from pathlib import Path
 import shutil
@@ -58,6 +59,24 @@ def _copy_skill(
     skill_dir = skills_dir / (destination_id or source_id)
     shutil.copytree(REPO_SKILLS_DIR / source_id, skill_dir)
     return skills_dir, skill_dir
+
+
+def _read_skill_md(skill_dir: Path) -> tuple[dict, str]:
+    text = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    _, frontmatter_text, body = text.split("---", 2)
+    return yaml.safe_load(frontmatter_text), body.lstrip("\n")
+
+
+def _write_skill_md(skill_dir: Path, frontmatter: dict, body: str) -> None:
+    frontmatter_text = yaml.safe_dump(
+        frontmatter,
+        sort_keys=False,
+        width=10_000,
+    )
+    (skill_dir / "SKILL.md").write_text(
+        f"---\n{frontmatter_text}---\n{body}",
+        encoding="utf-8",
+    )
 
 
 @pytest.mark.parametrize("skill_id", sorted(EXPECTED_PRIMITIVES))
@@ -177,6 +196,112 @@ def test_rejects_non_mapping_frontmatter(tmp_path: Path):
         load_skill("lane-change-overtake", skills_dir=skills_dir)
 
 
+def test_rejects_undocumented_frontmatter_key(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    frontmatter, body = _read_skill_md(skill_dir)
+    frontmatter["undocumented"] = "value"
+    _write_skill_md(skill_dir, frontmatter, body)
+
+    with pytest.raises(ValueError, match="frontmatter fields"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+@pytest.mark.parametrize("missing_field", ["name", "description", "metadata"])
+def test_rejects_missing_frontmatter_field(tmp_path: Path, missing_field: str):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    frontmatter, body = _read_skill_md(skill_dir)
+    del frontmatter[missing_field]
+    _write_skill_md(skill_dir, frontmatter, body)
+
+    with pytest.raises(ValueError, match="frontmatter fields"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+@pytest.mark.parametrize(
+    "description_yaml",
+    [
+        "description: >-\n  first line\n  second line\n",
+        "description: first line\n  second line\n",
+    ],
+)
+def test_rejects_multiline_frontmatter_description(
+    tmp_path: Path,
+    description_yaml: str,
+):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    _, body = _read_skill_md(skill_dir)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: lane-change-overtake\n"
+        f"{description_yaml}"
+        "metadata:\n"
+        '  schema_version: "0.1"\n'
+        "  representation: skill.yaml\n"
+        "---\n"
+        f"{body}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="description.*single-line"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        "skill.yaml",
+        {"schema_version": "0.1"},
+        {"representation": "skill.yaml"},
+        {
+            "schema_version": "0.1",
+            "representation": "skill.yaml",
+            "undocumented": "value",
+        },
+        {"schema_version": 0.1, "representation": "skill.yaml"},
+        {"schema_version": "0.1", "representation": "other.yaml"},
+    ],
+)
+def test_rejects_invalid_frontmatter_metadata(tmp_path: Path, metadata):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    frontmatter, body = _read_skill_md(skill_dir)
+    frontmatter["metadata"] = metadata
+    _write_skill_md(skill_dir, frontmatter, body)
+
+    with pytest.raises(ValueError, match="frontmatter metadata"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_frontmatter_schema_version_mismatch(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    frontmatter, body = _read_skill_md(skill_dir)
+    frontmatter["metadata"]["schema_version"] = "9.9"
+    _write_skill_md(skill_dir, frontmatter, body)
+
+    with pytest.raises(ValueError, match="schema_version mismatch"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_duplicate_frontmatter_metadata_key(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    _, body = _read_skill_md(skill_dir)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: lane-change-overtake\n"
+        "description: A single-line description.\n"
+        "metadata:\n"
+        '  schema_version: "0.1"\n'
+        '  schema_version: "0.1"\n'
+        "  representation: skill.yaml\n"
+        "---\n"
+        f"{body}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="frontmatter metadata"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
 def test_accepts_optional_final_references_heading(tmp_path: Path):
     skills_dir, skill_dir = _copy_skill(tmp_path)
     md_path = skill_dir / "SKILL.md"
@@ -192,6 +317,33 @@ def test_accepts_optional_final_references_heading(tmp_path: Path):
     assert card.skill_md_body.rstrip().endswith(
         "## References\n- HighwayEnv documentation"
     )
+
+
+@pytest.mark.parametrize(
+    ("opening_fence", "closing_fence"),
+    [
+        ("```markdown", "```"),
+        ("~~~~text", "~~~~"),
+    ],
+)
+def test_ignores_level_two_headings_inside_fenced_code_blocks(
+    tmp_path: Path,
+    opening_fence: str,
+    closing_fence: str,
+):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    md_path = skill_dir / "SKILL.md"
+    text = md_path.read_text(encoding="utf-8").replace(
+        "## Reasoning cues",
+        f"{opening_fence}\n## Not a real section\n{closing_fence}\n\n"
+        "## Reasoning cues",
+        1,
+    )
+    md_path.write_text(text, encoding="utf-8")
+
+    card = load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+    assert "## Not a real section" in card.skill_md_body
 
 
 @pytest.mark.parametrize(
@@ -279,3 +431,45 @@ def test_rejects_schema_invalid_skill_yaml(tmp_path: Path):
 
     with pytest.raises(ValueError, match=r"skill\.yaml validation failed"):
         load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_breaks_yaml_aliases_between_mutable_skill_fields(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    yaml_path = skill_dir / "skill.yaml"
+    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+
+    shared_labels = ["shared-label"]
+    data["tags"] = shared_labels
+    data["related_skills"] = shared_labels
+
+    shared_criteria = ["shared criterion"]
+    data["preconditions"] = shared_criteria
+    data["effects"] = shared_criteria
+
+    shared_features = data["interface"]["observations"][0]["features"]
+    data["groundings"][0]["observation"]["features"] = shared_features
+
+    second_grounding = copy.deepcopy(data["groundings"][0])
+    second_grounding["backend"] = "alternate-highway-env"
+    second_grounding["observation"] = data["groundings"][0]["observation"]
+    second_grounding["action"] = data["groundings"][0]["action"]
+    second_grounding["primitive_map"] = data["groundings"][0]["primitive_map"]
+    data["groundings"].append(second_grounding)
+    yaml_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    card = load_skill("lane-change-overtake", skills_dir=skills_dir)
+    first_grounding, second_grounding = card.groundings
+
+    card.tags.append("tags-only")
+    card.preconditions.append("preconditions-only")
+    card.interface["observations"][0]["features"].append("interface-only")
+    first_grounding.observation["features"].append("observation-only")
+    first_grounding.action["runtime-only"] = True
+    first_grounding.primitive_map["runtime-only"] = "IDLE"
+
+    assert card.related_skills == ["shared-label"]
+    assert card.effects == ["shared criterion"]
+    assert "interface-only" not in first_grounding.observation["features"]
+    assert "observation-only" not in second_grounding.observation["features"]
+    assert "runtime-only" not in second_grounding.action
+    assert "runtime-only" not in second_grounding.primitive_map

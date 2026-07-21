@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 import yaml
+from yaml.nodes import MappingNode
 
 from .types import Grounding, SkillCard
 
@@ -25,6 +27,9 @@ REQUIRED_HEADINGS = (
 OPTIONAL_FINAL_HEADING = "## References"
 _SKILL_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _LEVEL_TWO_HEADING = re.compile(r"^##(?:\s|$)")
+_FENCE_LINE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<rest>.*)$")
+_FRONTMATTER_FIELDS = {"name", "description", "metadata"}
+_METADATA_FIELDS = {"schema_version", "representation"}
 
 
 def _validate_skill_id(skill_id: str) -> None:
@@ -55,29 +60,108 @@ def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     if closing_index is None:
         raise ValueError("SKILL.md frontmatter is missing its closing '---' fence")
 
+    frontmatter_text = "".join(lines[1:closing_index])
     try:
-        frontmatter = yaml.safe_load("".join(lines[1:closing_index]))
+        frontmatter_node = yaml.compose(frontmatter_text)
+        frontmatter = yaml.safe_load(frontmatter_text)
     except yaml.YAMLError as exc:
         raise ValueError(f"SKILL.md frontmatter is invalid YAML: {exc}") from exc
-    if not isinstance(frontmatter, dict):
+    if not isinstance(frontmatter_node, MappingNode) or not isinstance(
+        frontmatter,
+        dict,
+    ):
         raise ValueError("SKILL.md frontmatter must be a mapping")
-    for field_name in ("name", "description"):
-        value = frontmatter.get(field_name)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"SKILL.md frontmatter field '{field_name}' must be a non-empty string"
-            )
+
+    field_nodes = {
+        key_node.value: value_node
+        for key_node, value_node in frontmatter_node.value
+    }
+    field_names = [key_node.value for key_node, _ in frontmatter_node.value]
+    if len(field_names) != len(_FRONTMATTER_FIELDS) or set(
+        field_names
+    ) != _FRONTMATTER_FIELDS:
+        raise ValueError(
+            "SKILL.md frontmatter fields must be exactly: "
+            + ", ".join(sorted(_FRONTMATTER_FIELDS))
+        )
+
+    name = frontmatter["name"]
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("SKILL.md frontmatter field 'name' must be a non-empty string")
+
+    description = frontmatter["description"]
+    description_node = field_nodes["description"]
+    if (
+        not isinstance(description, str)
+        or not description.strip()
+        or "\n" in description
+        or "\r" in description
+        or description_node.start_mark.line != description_node.end_mark.line
+    ):
+        raise ValueError(
+            "SKILL.md frontmatter description must be a non-empty single-line string"
+        )
+
+    metadata = frontmatter["metadata"]
+    metadata_node = field_nodes["metadata"]
+    if not isinstance(metadata, dict) or not isinstance(metadata_node, MappingNode):
+        raise ValueError(
+            "SKILL.md frontmatter metadata must be a mapping with exactly "
+            "schema_version and representation"
+        )
+    metadata_field_names = [
+        key_node.value for key_node, _ in metadata_node.value
+    ]
+    if (
+        len(metadata_field_names) != len(_METADATA_FIELDS)
+        or set(metadata_field_names) != _METADATA_FIELDS
+    ):
+        raise ValueError(
+            "SKILL.md frontmatter metadata must be a mapping with exactly "
+            "schema_version and representation"
+        )
+    if not isinstance(metadata["schema_version"], str):
+        raise ValueError(
+            "SKILL.md frontmatter metadata schema_version must be a string"
+        )
+    if metadata["representation"] != "skill.yaml":
+        raise ValueError(
+            "SKILL.md frontmatter metadata representation must equal 'skill.yaml'"
+        )
 
     body = "".join(lines[closing_index + 1 :]).lstrip("\r\n")
     return frontmatter, body
 
 
+def _headings_outside_fences(body: str) -> list[str]:
+    headings: list[str] = []
+    fence_character: str | None = None
+    fence_length = 0
+
+    for line in body.splitlines():
+        fence_match = _FENCE_LINE.match(line)
+        if fence_match:
+            fence = fence_match.group("fence")
+            rest = fence_match.group("rest")
+            if fence_character is None:
+                fence_character = fence[0]
+                fence_length = len(fence)
+            elif (
+                fence[0] == fence_character
+                and len(fence) >= fence_length
+                and not rest.strip()
+            ):
+                fence_character = None
+                fence_length = 0
+            continue
+        if fence_character is None and _LEVEL_TWO_HEADING.match(line):
+            headings.append(line)
+
+    return headings
+
+
 def _validate_headings(body: str) -> None:
-    headings = [
-        line
-        for line in body.splitlines()
-        if _LEVEL_TWO_HEADING.match(line)
-    ]
+    headings = _headings_outside_fences(body)
     allowed_headings = (
         list(REQUIRED_HEADINGS),
         [*REQUIRED_HEADINGS, OPTIONAL_FINAL_HEADING],
@@ -137,6 +221,13 @@ def load_skill(skill_id: str, skills_dir: Path = SKILLS_DIR) -> SkillCard:
     _validate_headings(body)
     data = _load_skill_yaml(yaml_text)
 
+    if frontmatter["metadata"]["schema_version"] != data["schema_version"]:
+        raise ValueError(
+            "SKILL.md frontmatter metadata schema_version mismatch: "
+            f"{frontmatter['metadata']['schema_version']!r} != "
+            f"{data['schema_version']!r}"
+        )
+
     names = {
         "folder": skill_id,
         "frontmatter": frontmatter["name"],
@@ -153,9 +244,9 @@ def load_skill(skill_id: str, skills_dir: Path = SKILLS_DIR) -> SkillCard:
             backend=grounding["backend"],
             backend_version=grounding["backend_version"],
             environment=grounding["environment"],
-            observation=grounding["observation"],
-            action=grounding["action"],
-            primitive_map=grounding["primitive_map"],
+            observation=deepcopy(grounding["observation"]),
+            action=deepcopy(grounding["action"]),
+            primitive_map=deepcopy(grounding["primitive_map"]),
         )
         for grounding in data["groundings"]
     ]
@@ -166,21 +257,21 @@ def load_skill(skill_id: str, skills_dir: Path = SKILLS_DIR) -> SkillCard:
         version=data["version"],
         domain=data["domain"],
         category=data["category"],
-        tags=data.get("tags", []),
+        tags=deepcopy(data.get("tags", [])),
         description=data["description"],
-        entities=data["entities"],
+        entities=deepcopy(data["entities"]),
         skill_md_body=body,
-        parameters=data.get("parameters", {}),
-        interface=data["interface"],
-        execution=data["execution"],
-        preconditions=data["preconditions"],
-        effects=data["effects"],
-        success_criteria=data["success_criteria"],
-        failure_criteria=data["failure_criteria"],
-        safety_constraints=data["safety_constraints"],
-        failure_modes=data["failure_modes"],
+        parameters=deepcopy(data.get("parameters", {})),
+        interface=deepcopy(data["interface"]),
+        execution=deepcopy(data["execution"]),
+        preconditions=deepcopy(data["preconditions"]),
+        effects=deepcopy(data["effects"]),
+        success_criteria=deepcopy(data["success_criteria"]),
+        failure_criteria=deepcopy(data["failure_criteria"]),
+        safety_constraints=deepcopy(data["safety_constraints"]),
+        failure_modes=deepcopy(data["failure_modes"]),
         termination=data["termination"],
-        related_skills=data.get("related_skills", []),
+        related_skills=deepcopy(data.get("related_skills", [])),
         groundings=groundings,
         primitives=_ordered_primitives(data["interface"]),
     )
