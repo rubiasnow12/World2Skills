@@ -145,7 +145,10 @@ def test_episode_result_defaults_json():
         overtake_step=2,
         lead_initial_gap_m=30.0,
     )
-    assert er.exception_type is None and er.step_records == []
+    assert er.exception_type is None
+    assert er.exception_message is None
+    assert er.step_records == []
     payload = asdict(er)
     assert payload["lead_initial_gap_m"] == 30.0
+    assert payload["exception_message"] is None
     json.dumps(payload)
