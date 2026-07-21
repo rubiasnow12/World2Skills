@@ -27,6 +27,7 @@ _OBSERVATION = np.array(
         [0.0, 0.0, 0.0, 0.0, 0.0],
     ]
 )
+_DEFAULT_SCENARIO_RESULT = object()
 
 
 def _scripted_overtake(messages: list[Message]) -> str:
@@ -177,7 +178,7 @@ class _FakeEnv:
     def __init__(
         self,
         transitions: list[
-            tuple[np.ndarray, float, bool, bool, Any]
+            tuple[np.ndarray, Any, Any, Any, Any]
         ],
         *,
         close_error: Exception | None = None,
@@ -193,15 +194,15 @@ class _FakeEnv:
     def step(
         self,
         action_index: int,
-    ) -> tuple[np.ndarray, float, bool, bool, Any]:
+    ) -> tuple[np.ndarray, Any, Any, Any, Any]:
         del action_index
         transition = self._transitions[self._index]
         self._index += 1
         info = transition[4]
         if isinstance(info, Mapping):
-            self.unwrapped.vehicle.crashed = bool(
-                info.get("crashed", False)
-            )
+            raw_crashed = info.get("crashed", False)
+            if isinstance(raw_crashed, (bool, np.bool_)):
+                self.unwrapped.vehicle.crashed = bool(raw_crashed)
         return transition
 
     def close(self) -> None:
@@ -217,10 +218,15 @@ class _FakeScenario:
         success_after_update: bool = False,
         reset_error: Exception | None = None,
         update_error: Exception | None = None,
+        terminal_result: Any = _DEFAULT_SCENARIO_RESULT,
+        evaluate_result: Any = _DEFAULT_SCENARIO_RESULT,
     ) -> None:
         self.success_after_update = success_after_update
         self.reset_error = reset_error
         self.update_error = update_error
+        self.terminal_result = terminal_result
+        self.evaluate_result = evaluate_result
+        self.evaluate_calls = 0
         self.target_initially_ahead = True
         self.lane_change_completed_step: int | None = None
         self.overtake_step: int | None = None
@@ -255,12 +261,17 @@ class _FakeScenario:
             self.overtake_step = t + 1
             self._success = True
 
-    def is_terminal(self, env: Any) -> tuple[bool, str]:
+    def is_terminal(self, env: Any) -> Any:
         del env
+        if self.terminal_result is not _DEFAULT_SCENARIO_RESULT:
+            return self.terminal_result
         return self._success, "success" if self._success else ""
 
-    def evaluate(self, env: Any) -> tuple[bool, str]:
+    def evaluate(self, env: Any) -> Any:
         del env
+        self.evaluate_calls += 1
+        if self.evaluate_result is not _DEFAULT_SCENARIO_RESULT:
+            return self.evaluate_result
         return (
             (True, "scripted success")
             if self._success
@@ -270,12 +281,12 @@ class _FakeScenario:
 
 def _transition(
     *,
-    reward: float = 1.0,
-    terminated: bool = False,
-    truncated: bool = False,
+    reward: Any = 1.0,
+    terminated: Any = False,
+    truncated: Any = False,
     speed: float = 20.0,
-    crashed: bool = False,
-) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+    crashed: Any = False,
+) -> tuple[np.ndarray, Any, Any, Any, dict[str, Any]]:
     return (
         _OBSERVATION.copy(),
         reward,
@@ -488,6 +499,265 @@ def test_missing_speed_preserves_completed_step_accounting() -> None:
     assert env.close_calls == 1
 
 
+@pytest.mark.parametrize(
+    "reward",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-inf"),
+        pytest.param(float("-inf"), id="negative-inf"),
+        pytest.param(True, id="bool"),
+        pytest.param(np.bool_(True), id="numpy-bool"),
+    ],
+)
+def test_invalid_reward_preserves_step_without_counting_return(
+    reward: Any,
+) -> None:
+    env = _FakeEnv(
+        [
+            _transition(
+                reward=reward,
+                terminated=True,
+                speed=18.0,
+                crashed=False,
+            )
+        ]
+    )
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision("parse_fallback")]),
+        _FakeScenario(),
+        seed=0,
+        max_steps=2,
+    )
+
+    assert result.status == "error"
+    assert result.exception_type == "ValueError"
+    assert result.exception_message == (
+        "env.step reward must be a finite real number"
+    )
+    assert result.episode_return == 0.0
+    assert result.mean_speed == pytest.approx(18.0)
+    assert result.terminated is True
+    assert result.truncated is False
+    assert result.parse_failures == 1
+    assert result.steps == 1
+    assert result.step_records[0].reward is None
+    assert result.step_records[0].crashed is False
+    assert env.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("terminated", "truncated", "expected_terminated", "expected_truncated"),
+    [
+        ("false", np.bool_(True), False, True),
+        (np.bool_(True), "false", True, False),
+    ],
+)
+def test_string_step_flags_are_rejected_without_coercion(
+    terminated: Any,
+    truncated: Any,
+    expected_terminated: bool,
+    expected_truncated: bool,
+) -> None:
+    env = _FakeEnv(
+        [
+            _transition(
+                reward=1.25,
+                terminated=terminated,
+                truncated=truncated,
+                speed=19.0,
+            )
+        ]
+    )
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision("unavailable_fallback")]),
+        _FakeScenario(),
+        seed=0,
+        max_steps=2,
+    )
+
+    assert result.status == "error"
+    assert result.exception_type == "TypeError"
+    assert "must be bool" in result.exception_message
+    assert result.episode_return == pytest.approx(1.25)
+    assert result.mean_speed == pytest.approx(19.0)
+    assert result.terminated is expected_terminated
+    assert result.truncated is expected_truncated
+    assert result.unavailable_action_attempts == 1
+    assert result.steps == 1
+    assert result.step_records[0].reward == pytest.approx(1.25)
+    assert env.close_calls == 1
+
+
+def test_numpy_bool_step_flags_and_crash_are_accepted() -> None:
+    env = _FakeEnv(
+        [
+            _transition(
+                reward=np.float64(1.5),
+                terminated=np.bool_(False),
+                truncated=np.bool_(True),
+                crashed=np.bool_(False),
+            )
+        ]
+    )
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision()]),
+        _FakeScenario(),
+        seed=0,
+        max_steps=2,
+    )
+
+    assert result.status == "ok"
+    assert result.episode_return == pytest.approx(1.5)
+    assert result.terminated is False
+    assert result.truncated is True
+    assert result.crashed is False
+    assert result.termination_reason == "truncated"
+    assert env.close_calls == 1
+
+
+def test_string_info_crashed_is_rejected_without_coercion() -> None:
+    env = _FakeEnv(
+        [
+            _transition(
+                reward=1.5,
+                terminated=True,
+                speed=17.0,
+                crashed="false",
+            )
+        ]
+    )
+    env.unwrapped.vehicle.crashed = True
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision("llm_error_fallback")]),
+        _FakeScenario(),
+        seed=0,
+        max_steps=2,
+    )
+
+    assert result.status == "error"
+    assert result.exception_type == "TypeError"
+    assert result.exception_message == "step info crashed must be bool"
+    assert result.episode_return == pytest.approx(1.5)
+    assert result.mean_speed == pytest.approx(17.0)
+    assert result.terminated is True
+    assert result.crashed is True
+    assert result.llm_errors == 1
+    assert result.steps == 1
+    assert result.step_records[0].reward == pytest.approx(1.5)
+    assert result.step_records[0].crashed is True
+    assert env.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "terminal_result",
+    [
+        pytest.param([False, ""], id="list"),
+        pytest.param((False,), id="short-tuple"),
+        pytest.param((0, ""), id="non-bool"),
+        pytest.param((False, None), id="non-string-reason"),
+    ],
+)
+def test_malformed_scenario_terminal_result_preserves_partial_step(
+    terminal_result: Any,
+) -> None:
+    env = _FakeEnv([_transition(reward=2.0, speed=16.0)])
+    scenario = _FakeScenario(terminal_result=terminal_result)
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision()]),
+        scenario,
+        seed=0,
+        max_steps=2,
+    )
+
+    assert result.status == "error"
+    assert result.exception_type == "TypeError"
+    assert "scenario.is_terminal" in result.exception_message
+    assert result.episode_return == pytest.approx(2.0)
+    assert result.mean_speed == pytest.approx(16.0)
+    assert result.steps == 1
+    assert scenario.evaluate_calls == 0
+    assert env.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "evaluate_result",
+    [
+        pytest.param([False, ""], id="list"),
+        pytest.param((False,), id="short-tuple"),
+        pytest.param((np.bool_(False), ""), id="numpy-bool"),
+        pytest.param((False, None), id="non-string-reason"),
+    ],
+)
+def test_malformed_scenario_evaluate_result_preserves_partial_step(
+    evaluate_result: Any,
+) -> None:
+    env = _FakeEnv([_transition(reward=2.0, truncated=True)])
+    scenario = _FakeScenario(evaluate_result=evaluate_result)
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision()]),
+        scenario,
+        seed=0,
+        max_steps=2,
+    )
+
+    assert result.status == "error"
+    assert result.exception_type == "TypeError"
+    assert "scenario.evaluate" in result.exception_message
+    assert result.episode_return == pytest.approx(2.0)
+    assert result.truncated is True
+    assert result.steps == 1
+    assert scenario.evaluate_calls == 1
+    assert env.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("terminal_result", "evaluate_result", "expected_completed"),
+    [
+        ((True, "success"), (False, "lost"), True),
+        ((False, ""), (True, "success"), False),
+    ],
+)
+def test_scenario_completion_must_match_final_success(
+    terminal_result: tuple[bool, str],
+    evaluate_result: tuple[bool, str],
+    expected_completed: bool,
+) -> None:
+    env = _FakeEnv([_transition()])
+    scenario = _FakeScenario(
+        terminal_result=terminal_result,
+        evaluate_result=evaluate_result,
+    )
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision()]),
+        scenario,
+        seed=0,
+        max_steps=1,
+    )
+
+    assert result.status == "error"
+    assert result.exception_type == "ValueError"
+    assert result.exception_message == (
+        "scenario completion disagrees with final success"
+    )
+    assert result.scenario_completed is expected_completed
+    assert result.steps == 1
+    assert env.close_calls == 1
+
+
 def test_reset_error_returns_error_result_and_closes() -> None:
     env = _FakeEnv([])
     scenario = _FakeScenario(reset_error=_ResetError("reset failed"))
@@ -527,6 +797,7 @@ def test_close_error_does_not_mask_primary_error() -> None:
     assert result.status == "error"
     assert result.exception_type == "_ResetError"
     assert result.exception_message == "reset failed"
+    assert result.cleanup_error == "_CloseError: close failed"
     assert env.close_calls == 1
 
 
@@ -546,6 +817,31 @@ def test_close_error_does_not_replace_normal_result() -> None:
 
     assert result.status == "ok"
     assert result.termination_reason == "max_steps"
+    assert result.cleanup_error == "_CloseError: close failed"
+    assert env.close_calls == 1
+
+
+def test_invalid_arguments_preserve_primary_error_when_close_fails() -> None:
+    env = _FakeEnv(
+        [],
+        close_error=_CloseError("close failed"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="seed must be a nonnegative integer",
+    ) as caught:
+        run_episode(
+            env,
+            _FakeExecutor([_decision()]),
+            _FakeScenario(),
+            seed=-1,
+            max_steps=1,
+        )
+
+    assert caught.value.__notes__ == [
+        "cleanup_error: _CloseError: close failed"
+    ]
     assert env.close_calls == 1
 
 

@@ -89,7 +89,7 @@ class StepRecord:
     primitive: str
     backend_action: str
     action_index: int
-    reward: float
+    reward: float | None
     crashed: bool
     request_hash: str
     raw_response: str
@@ -106,7 +106,7 @@ class StepRecord:
         *,
         t: int,
         obs_summary: str,
-        reward: float,
+        reward: float | None,
         crashed: bool,
     ) -> StepRecord:
         return cls(
@@ -151,6 +151,7 @@ class EpisodeResult:
     lead_initial_gap_m: float | None = None
     exception_type: str | None = None
     exception_message: str | None = None
+    cleanup_error: str | None = None
     step_records: list[StepRecord] = field(default_factory=list)
 
 

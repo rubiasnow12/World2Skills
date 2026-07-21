@@ -7,6 +7,8 @@ import math
 from numbers import Real
 from typing import Any
 
+import numpy as np
+
 from ..runtime.obs_render import render
 from ..runtime.types import EpisodeResult, StepRecord
 
@@ -44,13 +46,58 @@ def _observed_speed(info: Mapping[str, Any]) -> float:
     return float(speed)
 
 
-def _step_crashed(env: Any, info: object) -> bool:
-    if isinstance(info, Mapping) and "crashed" in info:
-        return bool(info["crashed"])
+def _validated_reward(value: object) -> float:
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+    ):
+        raise ValueError(
+            "env.step reward must be a finite real number"
+        )
+    return float(value)
+
+
+def _validated_bool(value: object, name: str) -> bool:
+    if not isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be bool")
+    return bool(value)
+
+
+def _best_effort_env_crashed(env: Any) -> bool:
     try:
-        return bool(getattr(env.unwrapped.vehicle, "crashed", False))
+        value = getattr(env.unwrapped.vehicle, "crashed", False)
     except Exception:
         return False
+    return (
+        bool(value)
+        if isinstance(value, (bool, np.bool_))
+        else False
+    )
+
+
+def _validated_scenario_result(
+    value: object,
+    source: str,
+) -> tuple[bool, str]:
+    if type(value) is not tuple or len(value) != 2:
+        raise TypeError(
+            f"{source} must return an exact 2-tuple (bool, str)"
+        )
+    outcome, reason = value
+    if type(outcome) is not bool or type(reason) is not str:
+        raise TypeError(
+            f"{source} must return an exact 2-tuple (bool, str)"
+        )
+    return outcome, reason
+
+
+def _cleanup_error(env: Any) -> str | None:
+    try:
+        env.close()
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 def _termination_reason(
@@ -195,30 +242,80 @@ def _run_episode(
             elif decision.decision_status == _LLM_ERROR_FALLBACK:
                 llm_errors += 1
 
-            obs, reward, terminated, truncated, info = env.step(
-                decision.action_index
+            (
+                obs,
+                reward,
+                raw_terminated,
+                raw_truncated,
+                info,
+            ) = env.step(decision.action_index)
+            record = StepRecord.from_decision(
+                decision,
+                t=t,
+                obs_summary=obs_text,
+                reward=None,
+                crashed=_best_effort_env_crashed(env),
             )
-            reward = float(reward)
-            episode_return += reward
-            step_crashed = _step_crashed(env, info)
-            crashed = crashed or step_crashed
-            records.append(
-                StepRecord.from_decision(
-                    decision,
-                    t=t,
-                    obs_summary=obs_text,
-                    reward=reward,
-                    crashed=step_crashed,
+            records.append(record)
+
+            validation_error: Exception | None = None
+            try:
+                validated_reward = _validated_reward(reward)
+            except Exception as exc:
+                validation_error = exc
+            else:
+                record.reward = validated_reward
+                episode_return += validated_reward
+
+            try:
+                terminated = _validated_bool(
+                    raw_terminated,
+                    "env.step terminated",
                 )
-            )
+            except Exception as exc:
+                if validation_error is None:
+                    validation_error = exc
+
+            try:
+                truncated = _validated_bool(
+                    raw_truncated,
+                    "env.step truncated",
+                )
+            except Exception as exc:
+                if validation_error is None:
+                    validation_error = exc
 
             if not isinstance(info, Mapping):
-                raise TypeError("env.step info must be a mapping")
-            speeds.append(_observed_speed(info))
+                if validation_error is None:
+                    validation_error = TypeError(
+                        "env.step info must be a mapping"
+                    )
+            else:
+                if "crashed" in info:
+                    try:
+                        record.crashed = _validated_bool(
+                            info["crashed"],
+                            "step info crashed",
+                        )
+                    except Exception as exc:
+                        if validation_error is None:
+                            validation_error = exc
+                try:
+                    speeds.append(_observed_speed(info))
+                except Exception as exc:
+                    if validation_error is None:
+                        validation_error = exc
+
+            crashed = crashed or record.crashed
+            if validation_error is not None:
+                raise validation_error
 
             prev_primitive = decision.primitive
             scenario.update(env, t)
-            transition_success, _ = scenario.is_terminal(env)
+            transition_success, _ = _validated_scenario_result(
+                scenario.is_terminal(env),
+                "scenario.is_terminal",
+            )
             scenario_completed = scenario_completed or bool(
                 transition_success
             )
@@ -234,7 +331,14 @@ def _run_episode(
             max_steps_reached = True
             termination_reason = "max_steps"
 
-        success, success_reason = scenario.evaluate(env)
+        success, success_reason = _validated_scenario_result(
+            scenario.evaluate(env),
+            "scenario.evaluate",
+        )
+        if scenario_completed != success:
+            raise ValueError(
+                "scenario completion disagrees with final success"
+            )
         return _episode_result(
             seed=seed,
             status="ok",
@@ -288,15 +392,18 @@ def run_episode(
 
     try:
         _validate_arguments(seed, max_steps)
-        return _run_episode(
+        result = _run_episode(
             env,
             executor,
             scenario,
             seed,
             max_steps,
         )
-    finally:
-        try:
-            env.close()
-        except Exception:
-            pass
+    except Exception as exc:
+        cleanup_error = _cleanup_error(env)
+        if cleanup_error is not None:
+            exc.add_note(f"cleanup_error: {cleanup_error}")
+        raise
+
+    result.cleanup_error = _cleanup_error(env)
+    return result

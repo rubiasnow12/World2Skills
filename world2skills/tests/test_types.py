@@ -1,5 +1,6 @@
 import json
 from dataclasses import asdict
+from typing import get_type_hints
 
 from world2skills.runtime.types import (
     DecisionResult,
@@ -122,6 +123,34 @@ def test_steprecord_copies_available_primitives():
     assert rec.available_primitives == ["accelerate", "maintain-speed"]
 
 
+def test_steprecord_allows_unknown_reward_after_executed_step():
+    dr = DecisionResult(
+        primitive="accelerate",
+        backend_action="FASTER",
+        action_index=3,
+        request_hash="abc",
+        raw_response='{"primitive": "accelerate"}',
+        cache_hit=False,
+        latency_ms=12.0,
+        decision_status="ok",
+        fallback_reason=None,
+        available_primitives=["accelerate", "maintain-speed"],
+    )
+
+    rec = StepRecord.from_decision(
+        dr,
+        t=0,
+        obs_summary="ego...",
+        reward=None,
+        crashed=False,
+    )
+
+    assert get_type_hints(StepRecord)["reward"] == float | None
+    assert rec.reward is None
+    assert asdict(rec)["reward"] is None
+    json.dumps(asdict(rec))
+
+
 def test_episode_result_defaults_json():
     er = EpisodeResult(
         seed=0,
@@ -147,8 +176,10 @@ def test_episode_result_defaults_json():
     )
     assert er.exception_type is None
     assert er.exception_message is None
+    assert er.cleanup_error is None
     assert er.step_records == []
     payload = asdict(er)
     assert payload["lead_initial_gap_m"] == 30.0
     assert payload["exception_message"] is None
+    assert payload["cleanup_error"] is None
     json.dumps(payload)
