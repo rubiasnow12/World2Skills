@@ -40,17 +40,26 @@
 
 ### 1.3 M1 的成功定义（可执行，替代自由文本 `success_criteria`）
 
-由 `LaneChangeOvertakeScenario` 在 reset 时绑定 `initial_lead_vehicle`，逐步跟踪：
+由 `LaneChangeOvertakeScenario` 在 reset 时绑定 `initial_lead_vehicle`，并记录
+**因果顺序**（先换道、后超越；避免「在原车道先超过、再换道」被误判成功）：
 
 ```
-success = ego 曾发生换道 (lane_changed)
-          AND ego 已超过 initial_lead_vehicle 至少 success_margin 米 (overtaken)
+target_initially_ahead        # reset 时目标车在 ego 前方
+lane_change_completed_step     # ego 首次完成换道（离开 initial_ego_lane）的步号
+overtake_step                  # ego 沿车道纵坐标首次领先目标车 >= success_margin 的步号
+
+success = target_initially_ahead
+          AND lane_change_completed_step is not None
+          AND overtake_step is not None
+          AND lane_change_completed_step < overtake_step   # 换道在先，超越在后
           AND collision == false
 ```
 
-`lane_changed`、`overtaken`、`collision` 均从**环境 Vehicle 对象的真值**读取，
-不依赖观测行号。场景初始化必须主动保证「慢车 + 邻接车道」前置条件成立——
-仅用随机 stock `highway-v0` 不能保证，见 §5。
+`lane_changed`（=`lane_change_completed_step is not None`）、`overtaken`、
+`collision` 均从**环境 Vehicle 对象的真值**读取，不依赖观测行号。**纵向距离用初始
+车道的 `lane.local_coordinates(position)[0]`（沿车道弧长），不用世界坐标
+`position[0]`**。场景初始化必须主动保证前置条件（慢车 + 邻接车道 + 目标车道安全
+间距）成立——仅用随机 stock `highway-v0` 不能保证，见 §5。
 
 > 5 seeds 是**工程验收**下限（证明闭环可跑通、指标齐全），不足以形成效果结论；
 > 效果结论留待 M2 扩大样本与加基线。
@@ -101,10 +110,14 @@ world2skills/
   preconditions/success_criteria/safety_constraints/...` + `primitives`（该技能
   允许的抽象原语集 = `interface.actions[].primitives` 并集）。
 - `ObservationContext`：`available_primitives`（当前可用抽象原语）、`ego_lane`、
-  `target_relation`（到绑定目标车的纵向间距/相对速度/在前或在后）、
-  `prev_primitive`、`left_lane_exists/right_lane_exists`、`left_gap/right_gap`。
-- `StepRecord`：`t/obs_summary/primitive/backend_action/action_index/reward/
-  crashed/cache_hit/latency_ms/note`。
+  `target_relation`（到绑定目标车的纵向间距/相对速度/在前或在后）、`prev_primitive`、
+  `left_lane_exists/right_lane_exists`，以及**前后分开的间距**：
+  `left_front_gap_m/left_rear_gap_m/left_rear_closing_speed_mps` 与右侧对应字段
+  （单一 `left_gap/right_gap` 无法表达技能要求的「前后均安全」）。
+- `StepRecord`：`t/obs_summary/primitive/backend_action/action_index/reward/crashed/
+  cache_hit/latency_ms/request_hash/raw_response/decision_status/fallback_reason/
+  available_primitives`（`decision_status` ∈ `ok`/`parse_fallback`/
+  `unavailable_fallback`/`llm_error_fallback`）。
 - `EpisodeResult`：见 §7 指标 + `status`（`ok`/`error`）+ 错误信息。
 - `BatchResult`：见 §7 `results.json` 结构。
 
@@ -147,32 +160,50 @@ M1 实现 `LaneChangeOvertakeScenario`：
 - `configure() -> dict`：返回 highway-v0 配置（`lanes_count>=2`、单受控车、
   DiscreteMetaAction、Kinematics、`duration`、`policy_frequency`、
   `simulation_frequency`）。
-- `reset(env, seed)`：
+- `reset(env, seed)`（**顺序关键**）：
   1. `env.reset(seed=seed)`；取 `ego = env.unwrapped.vehicle`、记 `initial_ego_lane`。
-  2. **强制前置条件**（主策略：reset 后改场景，确定性强）：找 ego 同车道最近前车；
-     若不存在则在 ego 前方同车道生成一辆；将其 `speed`/`target_speed` 设为
-     `lead_speed_ratio × ego_target_speed`（默认 0.6）。确认存在邻接车道
-     （highway-v0 多车道天然满足）。
-  3. **绑定** `initial_lead_vehicle = 该车对象`，记初始纵向位置。
-  4. 返回 `(obs, info, ObservationContext 初值)`。
+  2. **强制前置条件**（主策略：reset 后改场景，确定性强）：
+     - 找 ego 同车道最近前车；若不存在则在 ego 前方同车道生成一辆；将其
+       `speed`/`target_speed` 设为 `lead_speed_ratio × ego_target_speed`（默认 0.6）。
+     - 选定 `target_lane`（邻接车道），**清理/重置其安全区**使
+       `target_lane_front_clearance_m` 与 `target_lane_rear_clearance_m` 均满足下限。
+     - 对绑定前车设 `enable_lane_change=False`，防止 IDMVehicle 经 MOBIL 自主换道
+       破坏任务。
+  3. **绑定** `initial_lead_vehicle = 该车对象`；记 `target_initially_ahead`、
+     `lead_initial_gap_m`（沿初始车道纵坐标）。
+  4. **改场景后 obs 已过期**：highway-env 的 `reset()` 是「先建场景再 `observe()`」，
+     故必须重新调用 `env.unwrapped.observation_type.observe()` 生成初始 obs，并据此
+     重建初始 context 再返回 `(obs, info, ctx)`。
+  5. `validate_preconditions()`：校验慢车、邻道、前后安全间距全部成立；不满足则
+     **明确报错**（不静默继续），该 seed 记场景装配失败。
   （备策略：seed 拒绝采样，仅在改场景不可行时用；M1 用主策略。）
-- `update(env)`：每步后刷新 `lane_changed`（ego `lane_index` 曾≠ `initial_ego_lane`）、
-  `overtaken`（`ego.position` 纵向 − `initial_lead_vehicle.position` 纵向 ≥
-  `success_margin`）、`collision`（`ego.crashed`）。所有量取自 Vehicle 对象真值。
+- `update(env)`：每步后按**因果顺序**刷新：`lane_change_completed_step`（ego
+  `lane_index` 首次离开 `initial_ego_lane` 的步号）、`overtake_step`（ego 沿初始车道
+  `local_coordinates` 纵坐标首次领先 `initial_lead_vehicle` ≥ `success_margin` 的步号）、
+  `collision`（`ego.crashed`）。所有量取自 Vehicle 对象真值。
+- `is_terminal() -> (done: bool, reason: str)`：**场景自身终止语义**。成功
+  （§1.3）即 `scenario_completed=True` 提前结束；否则交给 env 的
+  terminated/truncated/max_steps（`highway-v0` 原生 terminated 主要是碰撞，不会因
+  超车成功而结束）。
 - `build_context(env, prev_primitive, available_primitives) -> ObservationContext`：
-  组装给 renderer 的上下文（目标车关系、可用原语、左右车道存在与间距）。
+  组装给 renderer 的上下文（目标车关系、可用原语、左右车道**前后分开**的间距与逼近速度）。
 - `evaluate() -> (success: bool, success_reason: str)`：按 §1.3 判定。
 
 参数：`success_margin`（默认 5 m）、`lead_speed_ratio`（默认 0.6）、`target_speed`
-（取技能 `parameters.target_speed.default`）。依赖 highway-env、`types`。
+（取技能 `parameters.target_speed.default`）、`target_lane_front_clearance_m` /
+`target_lane_rear_clearance_m`（默认下限，如技能 `min_lane_gap` 的默认 20 m）。
+依赖 highway-env、`types`。
 
 ### 3.5 `runtime/obs_render.py`
 
 `render(observation, context: ObservationContext) -> str`：**必须接收环境上下文**，
 不能只看 ndarray。Kinematics 数组无车道拓扑与稳定车辆 ID，默认还归一化。
-渲染内容：ego 行（米制）+ 最近若干邻车行 + 上下文派生字段（当前可用原语、
-ego 所在车道、到目标车的纵向间距/相对速度、左右车道是否存在及间距、上一步原语）。
-目标车身份来自 scenario，不靠观测行号。依赖 `numpy`、`types`。
+**坐标语义必须显式统一，不能逐行照抄原始数组**：Kinematics 首行 ego 与邻车行处理
+不同（`absolute=False` 时 ego 保持绝对、邻车才相对 ego）。renderer 统一输出为
+**ego 固定 `(0,0)`、所有邻车 ego-relative**（米制）。
+渲染内容：ego 行 + 最近若干邻车行 + 上下文派生字段（当前可用原语、ego 所在车道、
+到目标车的纵向间距/相对速度、左右车道**前后分开**的安全间距与后车逼近速度、
+上一步原语）。目标车身份来自 scenario，不靠观测行号。依赖 `numpy`、`types`。
 
 ### 3.6 `runtime/executor.py`
 
@@ -217,7 +248,11 @@ ego 所在车道、到目标车的纵向间距/相对速度、左右车道是否
 `run_episode(env, executor, scenario, name_to_index, max_steps) -> EpisodeResult`：
 每步 `ctx = scenario.build_context(...) → obs_text = render(obs, ctx) →
 executor.decide(obs_text, ctx, ctx.available_primitives) → env.step →
-scenario.update`，累积 `StepRecord`，直到 `terminated/truncated/max_steps`。结束时 `scenario.evaluate()` + 基础指标。
+scenario.update`，累积 `StepRecord`，**停止条件 = `scenario.is_terminal()` 成功
+提前结束 OR env `terminated/truncated` OR `max_steps`**。结束时 `scenario.evaluate()`
++ 基础指标；成功提前结束时保留 Gymnasium 原始字段真值
+（`terminated=false/truncated=false`）而置 `scenario_completed=true`、
+`termination_reason="success"`。
 **异常处理**：整个循环 try/except，异常 → `EpisodeResult(status="error",
 exception_type, steps_done, ...)`；`finally: env.close()`。依赖 §3.4–3.7、`types`。
 
@@ -247,8 +282,10 @@ scenario 参数）。
 ## 5. 确定性任务场景（为什么不能用 stock highway-v0）
 
 Stock `highway-v0` 随机初始化，不保证 ego 车道前方有慢车、也不保证「超车」有明确
-目标对象。M1 由 `LaneChangeOvertakeScenario`（§3.4）在 reset 后主动改场景以满足
-`preconditions`（慢速前车 + 邻接车道），并绑定唯一目标车，使 §1.3 的成功判定良定义。
+目标对象，且 IDMVehicle 可能经 MOBIL 自主换道。M1 由 `LaneChangeOvertakeScenario`
+（§3.4）在 reset 后主动改场景以满足 `preconditions`（慢速前车 + 邻接车道 +
+目标车道前后安全间距 + 关闭前车自主换道），绑定唯一目标车并
+`validate_preconditions()`，使 §1.3 的成功判定良定义。
 
 ## 6. 动作映射与解析（正确性要点汇总）
 
@@ -266,8 +303,8 @@ Stock `highway-v0` 随机初始化，不保证 ego 车道前方有慢车、也�
 ```
 episode_return, crashed, steps, mean_speed
 parse_failures, unavailable_action_attempts, llm_errors
-terminated, truncated, max_steps_reached, termination_reason
-lane_changed, overtaken                # 场景特有
+terminated, truncated, max_steps_reached, scenario_completed, termination_reason
+target_initially_ahead, lane_change_completed_step, overtake_step   # 场景特有
 success, success_reason
 status                                 # ok | error（异常 episode）
 ```
@@ -287,14 +324,19 @@ status                                 # ok | error（异常 episode）
   "collision_rate": 0.2,
   "mean_return": 23.4,
   "results": [
-    {"seed": 0, "status": "ok", "success": true, "success_reason": "overtook lead by 6.2m after left change",
-     "episode_return": 25.1, "crashed": false, "steps": 38, "mean_speed": 24.3,
+    {"seed": 0, "status": "ok", "success": true, "success_reason": "lane change @step12 then overtook lead by 6.2m @step27",
+     "episode_return": 25.1, "crashed": false, "steps": 27, "mean_speed": 24.3,
      "parse_failures": 0, "unavailable_action_attempts": 0, "llm_errors": 0,
-     "terminated": true, "truncated": false, "max_steps_reached": false,
-     "termination_reason": "success", "lane_changed": true, "overtaken": true}
+     "terminated": false, "truncated": false, "max_steps_reached": false,
+     "scenario_completed": true, "termination_reason": "success",
+     "target_initially_ahead": true, "lane_change_completed_step": 12, "overtake_step": 27}
   ]
 }
 ```
+
+**聚合语义**：`success_rate = successes / requested_seeds`（分母是请求的种子数，
+不是完成数）；**error episode 计失败**；`collision_rate` 同理按 `requested_seeds`；
+`mean_return` **仅统计 `status="ok"` 的 episode**。
 
 ## 8. 模型接入与缓存
 
@@ -329,8 +371,9 @@ status                                 # ok | error（异常 episode）
   - 非法 JSON → 回退 + `parse_failures`；
   - 未知原语 → 回退 + `parse_failures`；
   - 不可用动作 → 回退 + `unavailable_action_attempts`。
-- `test_scenario_evaluator`：绑定同一 lead vehicle，验证「真正超过同一目标 + 换道 +
-  无碰撞」才 success；只换道 / 超过的是别的车 / 有碰撞 → 非 success。
+- `test_scenario_evaluator`：绑定同一 lead vehicle，验证「**先换道后超越**同一目标 +
+  无碰撞」才 success；只换道 / 在原车道先超越后换道（因果反了）/ 超过的是别的车 /
+  有碰撞 → 非 success。
 - `test_results_schema`：序列化一批（含 1 个 error episode），断言 `schema_version`、
   `seeds[]`、每 episode 必需字段、error episode 的 `status:"error"` 契约。
 - `test_episode_smoke`（需装 highway-env，缺失则 skip）：脚本策略（恒定 accelerate）
@@ -342,13 +385,18 @@ status                                 # ok | error（异常 episode）
 1. `pytest world2skills/tests` 全绿（单测 + smoke；smoke 需已装 highway-env）。
 2. CLI 跑 `lane-change-overtake @ highway-v0` 5 个固定种子（GPT-5.4）完成，产出
    `results.json`（schema v0.1）、逐 episode 轨迹、`config.json`（含实际版本）。
-3. 每个种子场景确有慢速前车 + 邻接车道；成功 = 换道 + 超越同一目标车 + 无碰撞。
+3. 每个种子场景确有慢速前车 + 邻接车道 + 目标车道安全间距（`validate_preconditions`
+   通过）；成功 = 先换道、后超越同一目标车、且无碰撞（因果顺序，见 §1.3）。
 4. 指标含 `parse_failures / unavailable_action_attempts / llm_errors`。
+5. **跑通判据**：`5/5 status="ok"`（无异常 episode）**且** `success_count >= 1`；
+   否则尚不能称「LLM 驱动跑通技能」。
 
 ## 13. 开放假设（实现前如无异议即采用）
 
-- 观测 `absolute`：默认 `False`（米制、ego 相对帧）；目标车跟踪走 env 对象，故帧仅
-  影响 LLM 文本表述。
+- 观测 `absolute`：默认 `False`。注意 `normalize` 与 `absolute` 独立，且
+  `absolute=False` 时**仅邻车相对 ego、ego 行保持绝对**；renderer 负责统一成
+  「ego=(0,0)、邻车 ego-relative」的米制表述（见 §3.5）。目标车跟踪一律走 env 对象，
+  故坐标帧只影响喂给 LLM 的文本。
 - `success_margin=5 m`、`lead_speed_ratio=0.6`。
 - `policy_frequency=1 Hz`、`duration=40 s`（≈40 步，`max_steps` 相应设定）。
 - 「无技能」基线与 5 技能铺开留 M2。
