@@ -13,7 +13,11 @@ import pytest
 
 pytest.importorskip("highway_env")
 
-from world2skills.runtime.env_factory import make_env, resolve_env_config
+from world2skills.runtime.env_factory import (
+    build_custom_env_config,
+    make_env,
+    resolve_env_config,
+)
 from world2skills.runtime.skill_loader import load_skill, select_grounding
 from world2skills.runtime.types import Grounding
 
@@ -159,6 +163,37 @@ def test_resolve_env_config_equals_real_make_env_config(
         assert scenario_config == config_before
     finally:
         env.close()
+
+
+def test_build_custom_env_config_is_pure_and_forces_backend_settings(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    config_before = deepcopy(scenario_config)
+
+    custom = build_custom_env_config(grounding, scenario_config)
+
+    assert scenario_config == config_before
+    assert "obs_vehicles_count" not in custom
+    assert "controlled_vehicles" not in custom
+    assert custom["observation"] == {
+        "type": "Kinematics",
+        "features": grounding.observation["features"],
+        "vehicles_count": 8,
+        "normalize": False,
+        "absolute": False,
+        "see_behind": True,
+        "order": "sorted",
+    }
+    assert custom["action"] == {"type": "DiscreteMetaAction"}
+    for key in (
+        "lanes_count",
+        "vehicles_count",
+        "duration",
+        "policy_frequency",
+        "simulation_frequency",
+    ):
+        assert custom[key] == scenario_config[key]
 
 
 def test_resolve_env_config_always_closes_probe_env(

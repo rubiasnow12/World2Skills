@@ -11,16 +11,19 @@ import math
 from numbers import Real
 import os
 from pathlib import Path
-import posixpath
 import re
 import subprocess
 import sys
 from typing import Any
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import yaml
 
-from ..runtime.env_factory import make_env, resolve_env_config
+from ..runtime.env_factory import (
+    build_custom_env_config,
+    make_env,
+    resolve_env_config,
+)
 from ..runtime.executor import LLMSkillExecutor
 from ..runtime.llm import (
     DEFAULT_AZURE_API_VERSION,
@@ -361,12 +364,13 @@ def _sanitize_endpoint(value: object) -> str | None:
         host = f"[{hostname}]" if ":" in hostname else hostname
         if parsed.port is not None:
             host = f"{host}:{parsed.port}"
-        normalized_path = posixpath.normpath(unquote(parsed.path or "/"))
-        normalized_path = f"/{normalized_path.lstrip('/')}"
-        if normalized_path == "/":
+        raw_path = parsed.path
+        raw_query = parsed.query
+        if raw_path in {"", "/"} and not raw_query:
             path = "/"
         else:
-            path_hash = hashlib.sha256(normalized_path.encode("utf-8")).hexdigest()[
+            identity = raw_path.encode("utf-8") + b"\0" + raw_query.encode("utf-8")
+            path_hash = hashlib.sha256(identity).hexdigest()[
                 :_ENDPOINT_PATH_HASH_LENGTH
             ]
             path = f"/_path_sha256_{path_hash}/"
@@ -694,10 +698,27 @@ def main(argv: list[str] | None = None) -> int:
         scenario_environment_config = scenario_snapshot.get("environment_config")
         if not isinstance(scenario_environment_config, dict):
             scenario_environment_config = LaneChangeOvertakeScenario.configure()
-        environment_config = resolve_env_config(
-            grounding,
-            scenario_environment_config,
-        )
+        try:
+            environment_config = resolve_env_config(
+                grounding,
+                scenario_environment_config,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve error-run publication
+            try:
+                custom_config: Any = build_custom_env_config(
+                    grounding,
+                    scenario_environment_config,
+                )
+            except Exception as custom_exc:  # noqa: BLE001
+                custom_config = {
+                    "build_status": "error",
+                    "build_error": _exception_text(custom_exc),
+                }
+            environment_config = {
+                "resolution_status": "error",
+                "resolution_error": _exception_text(exc),
+                "custom_config": custom_config,
+            }
     batch = aggregate(
         results,
         model=actual_model,

@@ -14,6 +14,7 @@ import pytest
 pytest.importorskip("highway_env")
 
 from world2skills.evaluation import run
+from world2skills.runtime import env_factory as env_factory_module
 from world2skills.runtime.types import EpisodeResult
 
 
@@ -463,6 +464,64 @@ def test_all_seed_env_failures_use_deterministic_environment_fallback(
     assert client.close_calls == 1
 
 
+def test_low_level_env_creation_failure_publishes_honest_custom_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient()
+    secret = "probe-secret-that-must-not-be-published"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    monkeypatch.setattr(run, "_build_client", lambda model, mock: client)
+
+    def fail_env_creation(grounding: Any) -> Any:
+        del grounding
+        raise RuntimeError(f"probe creation failed with {secret}")
+
+    monkeypatch.setattr(
+        env_factory_module,
+        "_make_unconfigured_env",
+        fail_env_creation,
+    )
+    out = tmp_path / "low-level-env-errors"
+
+    assert (
+        run.main(
+            [
+                "--seeds",
+                "0",
+                "1",
+                "--mock",
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+
+    results = _read_json(out / "results.json")
+    assert results["error_episodes"] == 2
+    assert [item["seed"] for item in results["results"]] == [0, 1]
+    assert all(item["status"] == "error" for item in results["results"])
+
+    config_text = (out / "config.json").read_text(encoding="utf-8")
+    config = json.loads(config_text)
+    environment = config["environment_config"]
+    assert environment["resolution_status"] == "error"
+    assert environment["resolution_error"] == (
+        "RuntimeError: probe creation failed with <redacted>"
+    )
+    card = run.load_skill("lane-change-overtake")
+    grounding = run.select_grounding(card, "highway-env")
+    assert environment["custom_config"] == (
+        env_factory_module.build_custom_env_config(
+            grounding,
+            run.LaneChangeOvertakeScenario.configure(),
+        )
+    )
+    assert secret not in config_text
+    assert client.close_calls == 1
+
+
 def test_all_scenario_constructor_failures_still_publish_environment_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -570,7 +629,7 @@ def test_actual_client_identity_and_resolved_env_config_are_recorded(
     assert rc == 0
     config = _read_json(out / "config.json")
     assert config["requested"]["model"] == "gpt-5.4-requested"
-    path_hash = hashlib.sha256("/openai".encode()).hexdigest()[:16]
+    path_hash = hashlib.sha256(b"/openai/\0api_key=hidden").hexdigest()[:16]
     assert config["client"] == {
         "api_type": "fake-responses",
         "api_version": "2099-01-01",
@@ -587,26 +646,30 @@ def test_actual_client_identity_and_resolved_env_config_are_recorded(
     assert [env.close_calls for env in envs] == [1]
 
 
-def test_sanitize_endpoint_hashes_normalized_path_without_leaking_it() -> None:
+def test_sanitize_endpoint_hashes_exact_raw_path_and_query_without_leaking() -> None:
     endpoint = (
         "https://user-secret:password-secret@example.test:8443/"
         "path-secret/nested?token=query-secret#fragment-secret"
     )
 
     sanitized = run._sanitize_endpoint(endpoint)
-    same_path = run._sanitize_endpoint(
-        "https://example.test:8443/path-secret/./nested/"
+    same_identity = run._sanitize_endpoint(
+        "https://other-user:other-password@example.test:8443/"
+        "path-secret/nested?token=query-secret#other-fragment"
     )
-    encoded_same_path = run._sanitize_endpoint(
-        "https://example.test:8443/%70ath-secret/nested"
+    encoded_path = run._sanitize_endpoint("https://example.test:8443/a%2Fb")
+    decoded_path = run._sanitize_endpoint("https://example.test:8443/a/b")
+    different_query = run._sanitize_endpoint(
+        "https://example.test:8443/path-secret/nested?token=other-secret"
     )
-    different_path = run._sanitize_endpoint("https://example.test:8443/openai")
 
-    expected_hash = hashlib.sha256("/path-secret/nested".encode()).hexdigest()[:16]
+    expected_hash = hashlib.sha256(
+        b"/path-secret/nested\0token=query-secret"
+    ).hexdigest()[:16]
     assert sanitized == (f"https://example.test:8443/_path_sha256_{expected_hash}/")
-    assert same_path == sanitized
-    assert encoded_same_path == sanitized
-    assert different_path != sanitized
+    assert same_identity == sanitized
+    assert encoded_path != decoded_path
+    assert different_query != sanitized
     for secret in (
         "user-secret",
         "password-secret",
@@ -616,15 +679,19 @@ def test_sanitize_endpoint_hashes_normalized_path_without_leaking_it() -> None:
         "fragment-secret",
     ):
         assert secret not in sanitized
-    assert "openai" not in different_path
+    assert "a%2Fb" not in encoded_path
+    assert "a/b" not in decoded_path
+    assert "other-secret" not in different_query
 
     assert (
         run._sanitize_endpoint(
-            "https://user-secret:password-secret@example.test:8443/"
-            "?token=query-secret#fragment-secret"
+            "https://user-secret:password-secret@example.test:8443/#fragment-secret"
         )
         == "https://example.test:8443/"
     )
+    root_query = run._sanitize_endpoint("https://example.test:8443/?token=query-secret")
+    assert root_query != "https://example.test:8443/"
+    assert "query-secret" not in root_query
 
 
 def test_client_close_failure_is_recorded_without_losing_results(

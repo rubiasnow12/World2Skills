@@ -97,10 +97,9 @@ def _validate_grounding(grounding: Grounding) -> list[str]:
     return features.copy()
 
 
-def _resolved_config(
+def _build_custom_config(
     scenario_config: dict[str, Any],
     features: list[str],
-    default_config: Mapping[str, Any],
 ) -> dict[str, Any]:
     if not isinstance(scenario_config, dict):
         raise TypeError("scenario_config must be a dict")
@@ -119,11 +118,7 @@ def _resolved_config(
     if type(obs_vehicles_count) is not int or obs_vehicles_count <= 0:
         raise ValueError("obs_vehicles_count must be a positive integer")
 
-    unknown = sorted(set(config) - set(default_config))
-    if unknown:
-        raise ValueError(f"unknown scenario_config keys: {unknown}")
-
-    _validate_core_scenario_values(config, default_config)
+    _validate_core_scenario_values(config, {})
 
     config["observation"] = {
         "type": _OBSERVATION_TYPE,
@@ -138,22 +133,35 @@ def _resolved_config(
     return config
 
 
+def build_custom_env_config(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> dict[str, Any]:
+    """Purely build validated custom fields forced by the grounding."""
+
+    features = _validate_grounding(grounding)
+    return _build_custom_config(scenario_config, features)
+
+
 def _complete_resolved_config(
     env: Any,
-    scenario_config: dict[str, Any],
-    features: list[str],
+    custom_config: dict[str, Any],
 ) -> dict[str, Any]:
     default_config = env.unwrapped.default_config()
     if not isinstance(default_config, Mapping):
         raise ValueError("highway-env default_config() must return a mapping")
+    scenario_fields = {
+        key: value
+        for key, value in custom_config.items()
+        if key not in _RESERVED_SCENARIO_KEYS
+    }
+    unknown = sorted(set(scenario_fields) - set(default_config))
+    if unknown:
+        raise ValueError(f"unknown scenario_config keys: {unknown}")
+    _validate_core_scenario_values(scenario_fields, default_config)
+
     resolved = dict(deepcopy(default_config))
-    resolved.update(
-        _resolved_config(
-            scenario_config,
-            features,
-            default_config,
-        )
-    )
+    resolved.update(deepcopy(custom_config))
     if resolved.get("offscreen_rendering") is None:
         resolved["offscreen_rendering"] = env.render_mode != "human"
     return resolved
@@ -286,14 +294,17 @@ def resolve_env_config(
 ) -> dict[str, Any]:
     """Return the complete validated config without retaining a probe env."""
 
-    features = _validate_grounding(grounding)
+    _validate_grounding(grounding)
     env = None
     try:
         env = _make_unconfigured_env(grounding)
+        custom_config = build_custom_env_config(
+            grounding,
+            scenario_config,
+        )
         return _complete_resolved_config(
             env,
-            scenario_config,
-            features,
+            custom_config,
         )
     finally:
         if env is not None:
@@ -307,15 +318,18 @@ def make_env(
 ) -> tuple[Any, dict[str, int]]:
     """Return a configured, reset environment and its action-name index map."""
 
-    features = _validate_grounding(grounding)
+    _validate_grounding(grounding)
 
     env = None
     try:
         env = _make_unconfigured_env(grounding)
+        custom_config = build_custom_env_config(
+            grounding,
+            scenario_config,
+        )
         config = _complete_resolved_config(
             env,
-            scenario_config,
-            features,
+            custom_config,
         )
         env.unwrapped.configure(config)
         obs, _ = env.reset(seed=seed)
@@ -324,7 +338,7 @@ def make_env(
 
         expected_shape = (
             config["observation"]["vehicles_count"],
-            len(features),
+            len(config["observation"]["features"]),
         )
         if not isinstance(obs, np.ndarray):
             raise ValueError("Kinematics reset observation must be a numpy ndarray")
