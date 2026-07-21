@@ -144,8 +144,8 @@ def _validate_core_scenario_values(
 ) -> None:
     if "lanes_count" in config:
         lanes_count = config["lanes_count"]
-        if type(lanes_count) is not int or lanes_count < 2:
-            raise ValueError("lanes_count must be an integer greater than or equal to 2")
+        if type(lanes_count) is not int or lanes_count <= 0:
+            raise ValueError("lanes_count must be a positive integer")
 
     if "vehicles_count" in config:
         vehicles_count = config["vehicles_count"]

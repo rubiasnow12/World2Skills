@@ -289,7 +289,6 @@ def test_make_env_rejects_caller_supplied_reserved_config_and_closes_env(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("lanes_count", 1),
         ("lanes_count", 0),
         ("lanes_count", -1),
         ("lanes_count", True),
@@ -331,6 +330,19 @@ def test_make_env_rejects_invalid_core_scenario_value_and_closes_env(
 
     assert fake_env.closed is True
     assert fake_env.configured_with is None
+
+
+def test_make_env_allows_single_lane_and_retains_config(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+) -> None:
+    scenario_config["lanes_count"] = 1
+
+    env, _ = make_env(grounding, scenario_config, seed=0)
+    try:
+        assert env.unwrapped.config["lanes_count"] == 1
+    finally:
+        env.close()
 
 
 def test_make_env_rejects_simulation_frequency_below_policy_frequency(
