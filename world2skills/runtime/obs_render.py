@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from numbers import Real
 
 import numpy as np
 
@@ -14,6 +15,61 @@ _REQUIRED_FEATURES = ("presence", "x", "y", "vx", "vy")
 
 def _measurement(value: float | None, unit: str) -> str:
     return "none" if value is None else f"{value:.1f} {unit}"
+
+
+def _is_finite_number(value: object) -> bool:
+    return (
+        isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
+    )
+
+
+def _validate_context(context: ObservationContext) -> None:
+    if not _is_finite_number(context.target_gap_m) or context.target_gap_m < 0:
+        raise ValueError("target_gap_m must be finite and nonnegative")
+    if not _is_finite_number(context.target_rel_speed_mps):
+        raise ValueError("target_rel_speed_mps must be finite")
+
+    for lane in ("left", "right"):
+        exists = getattr(context, f"{lane}_lane_exists")
+        metric_names = (
+            f"{lane}_front_gap_m",
+            f"{lane}_rear_gap_m",
+            f"{lane}_rear_closing_speed_mps",
+        )
+        if not exists and any(
+            getattr(context, name) is not None for name in metric_names
+        ):
+            raise ValueError(
+                f"{lane} lane metrics must be None when {lane}_lane_exists is false"
+            )
+
+    for name in (
+        "left_front_gap_m",
+        "left_rear_gap_m",
+        "right_front_gap_m",
+        "right_rear_gap_m",
+    ):
+        value = getattr(context, name)
+        if value is not None and (not _is_finite_number(value) or value < 0):
+            raise ValueError(f"{name} must be finite and nonnegative")
+
+    for name in (
+        "left_rear_closing_speed_mps",
+        "right_rear_closing_speed_mps",
+    ):
+        value = getattr(context, name)
+        if value is not None and not _is_finite_number(value):
+            raise ValueError(f"{name} must be finite")
+
+    if not isinstance(context.available_primitives, list) or any(
+        not isinstance(primitive, str) or not primitive.strip()
+        for primitive in context.available_primitives
+    ):
+        raise ValueError("available_primitives must contain only non-empty strings")
+    if context.prev_primitive is not None and not isinstance(
+        context.prev_primitive, str
+    ):
+        raise ValueError("prev_primitive must be None or a string")
 
 
 def _validate_observation(
@@ -44,9 +100,11 @@ def _validate_observation(
     presence = values[:, indexes["presence"]]
     if not np.isfinite(presence).all():
         raise ValueError("presence values must be finite")
+    if not np.isin(presence, (0.0, 1.0)).all():
+        raise ValueError("presence values must be exactly 0 or 1")
     if presence[0] <= 0:
         raise ValueError("ego presence must be positive")
-    if not np.isfinite(values[presence > 0]).all():
+    if not np.isfinite(values[presence == 1]).all():
         raise ValueError("present rows must contain only finite values")
 
     return values, indexes
@@ -60,17 +118,13 @@ def render(
     """Return an ego-relative observation and scenario summary for the LLM."""
 
     values, indexes = _validate_observation(observation, feature_names)
+    _validate_context(context)
     ego = values[0]
     ego_speed = math.hypot(ego[indexes["vx"]], ego[indexes["vy"]])
 
-    neighbors = [
-        row
-        for row in values[1:]
-        if row[indexes["presence"]] > 0
-    ]
+    neighbors = [row for row in values[1:] if row[indexes["presence"]] == 1]
     lines = [
-        f"Ego: position=(0.0, 0.0) lane={context.ego_lane} "
-        f"speed={ego_speed:.1f} m/s",
+        f"Ego: position=(0.0, 0.0) lane={context.ego_lane} speed={ego_speed:.1f} m/s",
         f"Neighbors: count={len(neighbors)} frame=ego-relative",
     ]
     for number, row in enumerate(neighbors, start=1):
@@ -88,6 +142,9 @@ def render(
         [
             f"Target: relation={target_relation} gap={context.target_gap_m:.1f} m "
             f"rel_speed={context.target_rel_speed_mps:.1f} m/s",
+            "Sign conventions: target rel_speed = target_speed - ego_speed; "
+            "negative means target slower. rear_closing_speed = "
+            "rear_speed - ego_speed; positive means rear closing.",
             f"Left lane: exists={str(context.left_lane_exists).lower()} "
             f"front_gap={_measurement(context.left_front_gap_m, 'm')} "
             f"rear_gap={_measurement(context.left_rear_gap_m, 'm')} "

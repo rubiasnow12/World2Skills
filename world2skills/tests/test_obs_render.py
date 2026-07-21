@@ -49,6 +49,9 @@ def test_render_returns_deterministic_compact_text_with_full_context():
             "Neighbors: count=1 frame=ego-relative",
             "  #1 dx=18.0 m dy=-4.0 m dvx=-10.0 m/s dvy=1.5 m/s",
             "Target: relation=ahead gap=18.0 m rel_speed=-10.0 m/s",
+            "Sign conventions: target rel_speed = target_speed - ego_speed; "
+            "negative means target slower. rear_closing_speed = "
+            "rear_speed - ego_speed; positive means rear closing.",
             "Left lane: exists=true front_gap=30.0 m rear_gap=25.0 m "
             "rear_closing_speed=-2.0 m/s",
             "Right lane: exists=false front_gap=none rear_gap=none "
@@ -153,7 +156,9 @@ def test_render_rejects_nonfinite_values_in_present_rows(bad_value):
         dtype=float,
     )
 
-    with pytest.raises(ValueError, match="present rows must contain only finite values"):
+    with pytest.raises(
+        ValueError, match="present rows must contain only finite values"
+    ):
         render(
             observation,
             _context(),
@@ -168,5 +173,160 @@ def test_render_rejects_nonfinite_presence():
         render(
             observation,
             _context(),
+            ["presence", "x", "y", "vx", "vy"],
+        )
+
+
+@pytest.mark.parametrize(
+    "presence",
+    [-1.0, 0.5, 2.0, np.nextafter(1.0, 2.0)],
+)
+def test_render_rejects_nonbinary_presence_before_rows_can_hide_nan(presence):
+    observation = np.array(
+        [
+            [1, 0, 0, 25, 0],
+            [presence, np.nan, 0, 0, 0],
+        ]
+    )
+
+    with pytest.raises(ValueError, match="presence values must be exactly 0 or 1"):
+        render(
+            observation,
+            _context(),
+            ["presence", "x", "y", "vx", "vy"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("target_gap_m", -0.1, "target_gap_m must be finite and nonnegative"),
+        ("target_gap_m", np.nan, "target_gap_m must be finite and nonnegative"),
+        ("target_gap_m", np.inf, "target_gap_m must be finite and nonnegative"),
+        ("target_rel_speed_mps", np.nan, "target_rel_speed_mps must be finite"),
+        ("target_rel_speed_mps", np.inf, "target_rel_speed_mps must be finite"),
+    ],
+)
+def test_render_rejects_invalid_target_context(field, value, message):
+    context = _context(**{field: value})
+    observation = np.array([[1, 0, 0, 25, 0]], dtype=float)
+
+    with pytest.raises(ValueError, match=message):
+        render(
+            observation,
+            context,
+            ["presence", "x", "y", "vx", "vy"],
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "left_front_gap_m",
+        "left_rear_gap_m",
+        "right_front_gap_m",
+        "right_rear_gap_m",
+    ],
+)
+@pytest.mark.parametrize("value", [-0.1, np.nan, np.inf])
+def test_render_rejects_invalid_optional_lane_gaps(field, value):
+    context = _context(
+        right_lane_exists=True,
+        **{field: value},
+    )
+    observation = np.array([[1, 0, 0, 25, 0]], dtype=float)
+
+    with pytest.raises(ValueError, match=f"{field} must be finite and nonnegative"):
+        render(
+            observation,
+            context,
+            ["presence", "x", "y", "vx", "vy"],
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "left_rear_closing_speed_mps",
+        "right_rear_closing_speed_mps",
+    ],
+)
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+def test_render_rejects_nonfinite_rear_closing_speeds(field, value):
+    context = _context(
+        right_lane_exists=True,
+        **{field: value},
+    )
+    observation = np.array([[1, 0, 0, 25, 0]], dtype=float)
+
+    with pytest.raises(ValueError, match=f"{field} must be finite"):
+        render(
+            observation,
+            context,
+            ["presence", "x", "y", "vx", "vy"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("lane", "field"),
+    [
+        ("left", "left_front_gap_m"),
+        ("left", "left_rear_gap_m"),
+        ("left", "left_rear_closing_speed_mps"),
+        ("right", "right_front_gap_m"),
+        ("right", "right_rear_gap_m"),
+        ("right", "right_rear_closing_speed_mps"),
+    ],
+)
+def test_render_requires_absent_lane_metrics_to_be_none(lane, field):
+    overrides = {
+        f"{lane}_lane_exists": False,
+        f"{lane}_front_gap_m": None,
+        f"{lane}_rear_gap_m": None,
+        f"{lane}_rear_closing_speed_mps": None,
+        field: 1.0,
+    }
+    context = _context(**overrides)
+    observation = np.array([[1, 0, 0, 25, 0]], dtype=float)
+
+    with pytest.raises(
+        ValueError,
+        match=f"{lane} lane metrics must be None when {lane}_lane_exists is false",
+    ):
+        render(
+            observation,
+            context,
+            ["presence", "x", "y", "vx", "vy"],
+        )
+
+
+@pytest.mark.parametrize(
+    "available_primitives",
+    [[""], ["   "], ["accelerate", ""], ["accelerate", 1]],
+)
+def test_render_rejects_invalid_available_primitives(available_primitives):
+    context = _context(available_primitives=available_primitives)
+    observation = np.array([[1, 0, 0, 25, 0]], dtype=float)
+
+    with pytest.raises(
+        ValueError,
+        match="available_primitives must contain only non-empty strings",
+    ):
+        render(
+            observation,
+            context,
+            ["presence", "x", "y", "vx", "vy"],
+        )
+
+
+@pytest.mark.parametrize("prev_primitive", [1, [], {}])
+def test_render_rejects_nonstring_previous_primitive(prev_primitive):
+    context = _context(prev_primitive=prev_primitive)
+    observation = np.array([[1, 0, 0, 25, 0]], dtype=float)
+
+    with pytest.raises(ValueError, match="prev_primitive must be None or a string"):
+        render(
+            observation,
+            context,
             ["presence", "x", "y", "vx", "vy"],
         )
