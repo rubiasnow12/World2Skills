@@ -114,10 +114,12 @@ world2skills/
   `left_lane_exists/right_lane_exists`，以及**前后分开的间距**：
   `left_front_gap_m/left_rear_gap_m/left_rear_closing_speed_mps` 与右侧对应字段
   （单一 `left_gap/right_gap` 无法表达技能要求的「前后均安全」）。
-- `StepRecord`：`t/obs_summary/primitive/backend_action/action_index/reward/crashed/
-  cache_hit/latency_ms/request_hash/raw_response/decision_status/fallback_reason/
-  available_primitives`（`decision_status` ∈ `ok`/`parse_fallback`/
+- `DecisionResult`（**executor 输出，`env.step` 前即可得**）：`primitive/backend_action/
+  action_index/request_hash/raw_response/cache_hit/latency_ms/decision_status/
+  fallback_reason/available_primitives`（`decision_status` ∈ `ok`/`parse_fallback`/
   `unavailable_fallback`/`llm_error_fallback`）。
+- `StepRecord`（**由 episode 在 `env.step` 后组装** = `DecisionResult` + step 结果）：
+  在 `DecisionResult` 基础上追加 `t/obs_summary/reward/crashed`。
 - `EpisodeResult`：见 §7 指标 + `status`（`ok`/`error`）+ 错误信息。
 - `BatchResult`：见 §7 `results.json` 结构。
 
@@ -207,7 +209,8 @@ M1 实现 `LaneChangeOvertakeScenario`：
 
 ### 3.6 `runtime/executor.py`
 
-`LLMSkillExecutor(skill_card, grounding, llm_client, prompt_version)`：
+`LLMSkillExecutor(skill_card, grounding, llm_client, prompt_version, name_to_index)`
+（`name_to_index` 由 `env_factory` 产出、**构造时注入**，executor 不持有 env）：
 
 - `build_messages(obs_text, context) -> list[Message]`：
   - system：策略角色 + 抽象原语语义 + 技能 `safety_constraints` +
@@ -215,16 +218,20 @@ M1 实现 `LaneChangeOvertakeScenario`：
   - user：技能卡（SKILL.md 正文 + skill.yaml 的 procedure/execution 作为建议流程、
     parameters、success/failure/safety）+ 观测文本 + **本步允许原语**（技能原语集
     ∩ 当前可用原语）+ 输出格式提醒。
-- `decide(obs_text, context, available_primitives) -> (action_index, StepRecord)`：
-  1. 调 LLM；异常经客户端重试后仍失败 → 计 `llm_errors`，回退。
+- `decide(obs_text, context, available_primitives) -> DecisionResult`：
+  1. 调 LLM；异常经客户端重试后仍失败 → `decision_status="llm_error_fallback"`、
+     计 `llm_errors`，回退。
   2. **结构化解析**：先剥离 fenced ```json 包裹，再 `json.loads`；取 `primitive`
      字段并校验 ∈ 技能原语集。**不允许在回复里搜子串**（"do not accelerate,
-     maintain-speed" 会歧义）。非法 JSON / 未知原语 → 回退 `maintain-speed`
-     （若不在集内则取该技能首个原语）+ 计 `parse_failures` + 记原始回复。
-  3. **可用性检查**：若所选原语当前不可用（不在 `available_primitives`）→ 显式回退
-     + 计 `unavailable_action_attempts`，**不静默交给环境**。
-  4. **映射**：原语 →（`grounding.primitive_map`）后端名 →（反转
-     `env.unwrapped.action_type.actions` 得 name→index）离散索引。
+     maintain-speed" 会歧义）。非法 JSON / 未知原语 → `decision_status="parse_fallback"`、
+     回退 `maintain-speed`（若不在集内则取该技能首个原语）+ 计 `parse_failures` +
+     记 `raw_response`。
+  3. **可用性检查**：若所选原语当前不可用（不在 `available_primitives`）→
+     `decision_status="unavailable_fallback"`、显式回退 + 计
+     `unavailable_action_attempts`，**不静默交给环境**。
+  4. **映射**：原语 →（`grounding.primitive_map`）后端名 →（**构造时注入的
+     `name_to_index`**）离散索引。`DecisionResult` 不含 `reward/crashed`（step 后才有，
+     由 episode 补齐成 `StepRecord`）。
 
 依赖 `llm`、`types`、`json`。
 
@@ -245,10 +252,12 @@ M1 实现 `LaneChangeOvertakeScenario`：
 
 ### 3.8 `evaluation/episode.py`
 
-`run_episode(env, executor, scenario, name_to_index, max_steps) -> EpisodeResult`：
-每步 `ctx = scenario.build_context(...) → obs_text = render(obs, ctx) →
-executor.decide(obs_text, ctx, ctx.available_primitives) → env.step →
-scenario.update`，累积 `StepRecord`，**停止条件 = `scenario.is_terminal()` 成功
+`run_episode(env, executor, scenario, max_steps) -> EpisodeResult`
+（`name_to_index` 已注入 executor，此处不再传）：每步 `ctx = scenario.build_context(...)
+→ obs_text = render(obs, ctx) → dr = executor.decide(obs_text, ctx,
+ctx.available_primitives) → obs,reward,term,trunc,info = env.step(dr.action_index)
+→ scenario.update → StepRecord = dr + {t, obs_summary, reward, crashed}`，累积
+`StepRecord`，**停止条件 = `scenario.is_terminal()` 成功
 提前结束 OR env `terminated/truncated` OR `max_steps`**。结束时 `scenario.evaluate()`
 + 基础指标；成功提前结束时保留 Gymnasium 原始字段真值
 （`terminated=false/truncated=false`）而置 `scenario_completed=true`、
@@ -272,8 +281,8 @@ scenario 参数）。
 
 ## 4. 数据流
 
-- **一步**：`obs → obs_render(obs, ctx) → executor.decide → action_index →
-  env.step → scenario.update → StepRecord`。
+- **一步**：`obs → obs_render(obs, ctx) → executor.decide → DecisionResult →
+  env.step(action_index) → scenario.update → StepRecord(=DecisionResult+step 结果)`。
 - **一集**：`scenario.reset(seed) → 循环步 → scenario.evaluate + 基础指标 →
   EpisodeResult`。
 - **一批**：`for seed in seeds: 建 env → run_episode`（M1 顺序）`→ aggregate →
@@ -319,7 +328,10 @@ status                                 # ok | error（异常 episode）
   "skill": "lane-change-overtake",
   "environment": "highway-v0",
   "seeds": [0, 1, 2, 3, 4],
-  "episodes": 5,
+  "requested_episodes": 5,
+  "completed_episodes": 5,
+  "error_episodes": 0,
+  "successful_episodes": 4,
   "success_rate": 0.8,
   "collision_rate": 0.2,
   "mean_return": 23.4,
@@ -334,8 +346,11 @@ status                                 # ok | error（异常 episode）
 }
 ```
 
-**聚合语义**：`success_rate = successes / requested_seeds`（分母是请求的种子数，
-不是完成数）；**error episode 计失败**；`collision_rate` 同理按 `requested_seeds`；
+**聚合语义**：`requested_episodes = len(seeds)`；`completed_episodes` =
+`status="ok"` 的数量；`error_episodes` = `status="error"` 的数量；
+`successful_episodes` = `success=true` 的数量。
+`success_rate = successful_episodes / requested_episodes`（分母是请求数，不是完成数）；
+**error episode 计失败**；`collision_rate` 同理按 `requested_episodes`；
 `mean_return` **仅统计 `status="ok"` 的 episode**。
 
 ## 8. 模型接入与缓存
@@ -388,8 +403,8 @@ status                                 # ok | error（异常 episode）
 3. 每个种子场景确有慢速前车 + 邻接车道 + 目标车道安全间距（`validate_preconditions`
    通过）；成功 = 先换道、后超越同一目标车、且无碰撞（因果顺序，见 §1.3）。
 4. 指标含 `parse_failures / unavailable_action_attempts / llm_errors`。
-5. **跑通判据**：`5/5 status="ok"`（无异常 episode）**且** `success_count >= 1`；
-   否则尚不能称「LLM 驱动跑通技能」。
+5. **跑通判据**：`completed_episodes == requested_episodes`（5/5，无 error episode）
+   **且** `successful_episodes >= 1`；否则尚不能称「LLM 驱动跑通技能」。
 
 ## 13. 开放假设（实现前如无异议即采用）
 
