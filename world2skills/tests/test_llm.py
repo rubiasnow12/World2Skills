@@ -6,7 +6,7 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from diskcache import Lock as DiskCacheLock
+from diskcache import Cache
 import httpx
 import openai
 import pytest
@@ -731,7 +731,6 @@ def test_lock_lease_covers_timeout_retry_and_safety_budget():
 
 def test_expired_stale_request_lock_recovers_with_finite_lease(
     tmp_path,
-    monkeypatch,
 ):
     provider = FakeOpenAIProvider(chat_outcomes=[_chat_response("recovered")])
     client = OpenAIClient(
@@ -756,21 +755,13 @@ def test_expired_stale_request_lock_recovers_with_finite_lease(
     )
     lock_key = ("world2skills.llm.request", request_hash)
     assert client._cache is not None
-    stale_lock = DiskCacheLock(
+    stale_lease = llm_module._CacheLease(
         client._cache,
         lock_key,
         expire=client.lock_lease_seconds,
+        owner_token="stale-owner",
     )
-    stale_lock.acquire()
-
-    observed_expirations: list[float | None] = []
-    real_lock = llm_module.Lock
-
-    def recording_lock(cache, key, expire=None, tag=None):
-        observed_expirations.append(expire)
-        return real_lock(cache, key, expire=expire, tag=tag)
-
-    monkeypatch.setattr(llm_module, "Lock", recording_lock)
+    stale_lease.acquire()
     started_at = time.perf_counter()
 
     result = client.chat(MESSAGES, prompt_version="pv")
@@ -779,8 +770,78 @@ def test_expired_stale_request_lock_recovers_with_finite_lease(
     client.close()
     assert result.reply == "recovered"
     assert elapsed < 1.0
-    assert observed_expirations == [client.lock_lease_seconds]
     assert len(provider.chat_create.calls) == 1
+
+
+def test_token_owned_lease_prevents_expired_owner_from_deleting_new_owner(
+    tmp_path,
+):
+    cache = Cache(str(tmp_path / "cache"), eviction_policy="none")
+    lock_key = ("world2skills.llm.request", "same-request")
+    owner_a = llm_module._CacheLease(
+        cache,
+        lock_key,
+        expire=0.03,
+        owner_token="owner-a",
+    )
+    owner_b = llm_module._CacheLease(
+        cache,
+        lock_key,
+        expire=1.0,
+        owner_token="owner-b",
+    )
+    owner_c_blocked = threading.Event()
+    allow_owner_c_retry = threading.Event()
+
+    def controlled_spin_sleep(delay: float) -> None:
+        assert delay == 0.001
+        owner_c_blocked.set()
+        if not allow_owner_c_retry.wait(timeout=1):
+            raise TimeoutError("test did not allow owner C to retry")
+
+    owner_c = llm_module._CacheLease(
+        cache,
+        lock_key,
+        expire=1.0,
+        owner_token="owner-c",
+        sleeper=controlled_spin_sleep,
+    )
+
+    owner_a.acquire()
+    cache.delete(lock_key, retry=True)  # Simulate A's lease expiring.
+    assert lock_key not in cache
+
+    owner_b.acquire()
+    assert cache.get(lock_key) == "owner-b"
+    owner_a.release()
+    assert cache.get(lock_key) == "owner-b"
+
+    owner_c_started = threading.Event()
+    owner_c_acquired = threading.Event()
+
+    def acquire_owner_c() -> None:
+        owner_c_started.set()
+        owner_c.acquire()
+        owner_c_acquired.set()
+
+    thread = threading.Thread(target=acquire_owner_c)
+    thread.start()
+    assert owner_c_started.wait(timeout=1)
+    try:
+        assert owner_c_blocked.wait(timeout=1)
+        assert not owner_c_acquired.is_set()
+        assert cache.get(lock_key) == "owner-b"
+    finally:
+        owner_b.release()
+        allow_owner_c_retry.set()
+
+    assert owner_c_acquired.wait(timeout=1)
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert cache.get(lock_key) == "owner-c"
+    owner_c.release()
+    assert lock_key not in cache
+    cache.close()
 
 
 def test_close_is_idempotent(tmp_path):

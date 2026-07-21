@@ -9,13 +9,14 @@ import math
 import os
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from diskcache import Cache, Lock
+from diskcache import Cache
 from openai import (
     APIConnectionError,
     APIStatusError,
@@ -96,6 +97,55 @@ def _message_payload(messages: Sequence[Message]) -> list[dict[str, str]]:
 
 def _canonicalize_base_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/"
+
+
+class _CacheLease:
+    """Cross-thread/process cache lease released only by its current owner."""
+
+    def __init__(
+        self,
+        cache: Cache,
+        key: Any,
+        *,
+        expire: float,
+        owner_token: str | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        self._cache = cache
+        self._key = key
+        self._expire = expire
+        self._owner_token = owner_token or uuid.uuid4().hex
+        self._sleeper = sleeper
+        self._acquired = False
+
+    def acquire(self) -> None:
+        if self._acquired:
+            raise RuntimeError("cache lease is already acquired")
+        while not self._cache.add(
+            self._key,
+            self._owner_token,
+            expire=self._expire,
+            retry=True,
+        ):
+            self._sleeper(0.001)
+        self._acquired = True
+
+    def release(self) -> None:
+        if not self._acquired:
+            return
+        try:
+            with self._cache.transact(retry=True):
+                if self._cache.get(self._key, retry=True) == self._owner_token:
+                    self._cache.delete(self._key, retry=True)
+        finally:
+            self._acquired = False
+
+    def __enter__(self) -> _CacheLease:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.release()
 
 
 def make_request_hash(
@@ -362,7 +412,7 @@ class _CachedOpenAIClient(LLMClient):
 
         if self._cache is not None:
             lock_key = ("world2skills.llm.request", request_hash)
-            with Lock(
+            with _CacheLease(
                 self._cache,
                 lock_key,
                 expire=self.lock_lease_seconds,
