@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from world2skills.evaluation.metrics import (
+    ArtifactPublicationError,
     aggregate,
     episode_to_result_dict,
     write_outputs,
@@ -57,6 +58,13 @@ def _fallback_step(
     )
 
 
+def _steps(count: int, *, reward: float = 0.0) -> list[StepRecord]:
+    return [
+        replace(_step(reward=reward), t=index)
+        for index in range(count)
+    ]
+
+
 def _episode(
     seed: int,
     *,
@@ -70,6 +78,14 @@ def _episode(
     cleanup_error: str | None = None,
 ) -> EpisodeResult:
     records = list(step_records or [])
+    if success:
+        while len(records) < 2:
+            records.append(
+                replace(
+                    _step(reward=0.0),
+                    t=len(records),
+                )
+            )
     resolved_return = (
         math.fsum(
             record.reward
@@ -102,8 +118,8 @@ def _episode(
         scenario_completed=success,
         termination_reason="success" if success else "error",
         target_initially_ahead=True,
-        lane_change_completed_step=1 if success else None,
-        overtake_step=2 if success else None,
+        lane_change_completed_step=0 if success else None,
+        overtake_step=1 if success else None,
         lead_initial_gap_m=30.0,
         exception_type=exception_type,
         exception_message=exception_message,
@@ -306,6 +322,28 @@ def test_aggregate_rejects_invalid_nonnegative_integer_fields(
         _batch([episode])
 
 
+@pytest.mark.parametrize("status", ["ok", "error"])
+@pytest.mark.parametrize(
+    "field",
+    ["lane_change_completed_step", "overtake_step"],
+)
+def test_aggregate_rejects_causal_step_outside_trace(
+    status: str,
+    field: str,
+) -> None:
+    episode = replace(
+        _episode(
+            0,
+            status=status,
+            step_records=[_step()],
+        ),
+        **{field: 1},
+    )
+
+    with pytest.raises(ValueError, match=rf"{field}.*steps"):
+        _batch([episode])
+
+
 def test_aggregate_rejects_successful_error_episode() -> None:
     episode = _episode(0, status="error", success=True)
 
@@ -321,6 +359,47 @@ def test_aggregate_rejects_step_count_trace_mismatch() -> None:
 
     with pytest.raises(ValueError, match="steps.*step_records"):
         _batch([episode])
+
+
+def test_ok_episode_rejects_none_reward() -> None:
+    episode = _episode(
+        0,
+        step_records=[_step(reward=None)],
+    )
+
+    with pytest.raises(ValueError, match="reward.*status='error'.*final"):
+        _batch([episode])
+
+
+def test_error_episode_rejects_none_reward_before_final_record() -> None:
+    records = [
+        _step(reward=None),
+        replace(_step(reward=0.5), t=1),
+    ]
+    episode = _episode(
+        0,
+        status="error",
+        step_records=records,
+    )
+
+    with pytest.raises(ValueError, match="reward.*final"):
+        _batch([episode])
+
+
+def test_error_episode_accepts_none_reward_on_final_record() -> None:
+    records = [
+        _step(reward=0.5),
+        replace(_step(reward=None), t=1),
+    ]
+    episode = _episode(
+        0,
+        status="error",
+        step_records=records,
+    )
+
+    batch = _batch([episode])
+
+    assert batch.results[0]["episode_return"] == 0.5
 
 
 @pytest.mark.parametrize(
@@ -511,6 +590,7 @@ def test_error_episode_preserves_completed_causal_state_and_writes(
         _episode(
             7,
             status="error",
+            step_records=_steps(6),
             exception_type="RuntimeError",
             exception_message="post-step evaluation failed",
         ),
@@ -616,15 +696,15 @@ def test_aggregate_rejects_out_of_range_summary_metrics(
         ({"overtake_step": None}, "causal steps"),
         (
             {
-                "lane_change_completed_step": 2,
-                "overtake_step": 2,
+                "lane_change_completed_step": 1,
+                "overtake_step": 1,
             },
             "lane_change.*overtake",
         ),
         (
             {
-                "lane_change_completed_step": 3,
-                "overtake_step": 2,
+                "lane_change_completed_step": 1,
+                "overtake_step": 0,
             },
             "lane_change.*overtake",
         ),
@@ -688,7 +768,7 @@ def test_write_outputs_writes_strict_summaries_and_full_traces(
     trace_lines = (tmp_path / "episode_0.jsonl").read_text(
         encoding="utf-8"
     ).splitlines()
-    assert len(trace_lines) == 1
+    assert len(trace_lines) == 2
     trace = json.loads(trace_lines[0])
     assert trace == asdict(results[1].step_records[0])
     assert trace["obs_summary"] == full_obs
@@ -941,4 +1021,44 @@ def test_staging_directory_fsync_failure_cleans_up(
         write_outputs(out, _batch(results), results, config={})
 
     assert not out.exists()
+    assert list(tmp_path.glob(".run.staging-*")) == []
+
+
+def test_parent_fsync_failure_reports_published_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from world2skills.evaluation import metrics
+
+    results = [_episode(0, step_records=[_step()])]
+    out = tmp_path / "run"
+    real_fsync = metrics._fsync_directory
+    calls = 0
+
+    def fail_parent_fsync(path: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("parent fsync failed")
+        real_fsync(path)
+
+    monkeypatch.setattr(
+        metrics,
+        "_fsync_directory",
+        fail_parent_fsync,
+    )
+
+    with pytest.raises(ArtifactPublicationError) as exc_info:
+        write_outputs(out, _batch(results), results, config={"seed": 0})
+
+    error = exc_info.value
+    assert error.path == out
+    assert error.published is True
+    assert isinstance(error.__cause__, OSError)
+    assert sorted(path.name for path in out.iterdir()) == [
+        "config.json",
+        "episode_0.jsonl",
+        "results.json",
+    ]
+    assert json.loads((out / "config.json").read_text()) == {"seed": 0}
     assert list(tmp_path.glob(".run.staging-*")) == []

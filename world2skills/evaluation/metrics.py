@@ -15,6 +15,24 @@ from typing import Any
 from ..runtime.types import BatchResult, EpisodeResult, StepRecord
 
 
+class ArtifactPublicationError(RuntimeError):
+    """Artifact publication failed after the output became visible."""
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        published: bool,
+    ) -> None:
+        self.path = Path(path)
+        self.published = published
+        state = "published" if published else "not published"
+        super().__init__(
+            f"artifact publication durability failed for "
+            f"{self.path} ({state})"
+        )
+
+
 SCHEMA_VERSION = "0.1"
 _VALID_STATUSES = frozenset({"ok", "error"})
 _VALID_DECISION_STATUSES = frozenset(
@@ -135,11 +153,16 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
             raise ValueError(
                 f"{field_name} must be a nonnegative integer or None"
             )
+        if value is not None and value >= result.steps:
+            raise ValueError(
+                f"{field_name} must be less than steps"
+            )
 
     if result.steps != len(result.step_records):
         raise ValueError("steps must equal len(step_records)")
     trace_counts, trace_return, trace_crashed = _validate_step_records(
-        result.step_records
+        result.step_records,
+        status=result.status,
     )
 
     for field_name in _FINITE_NUMBER_FIELDS:
@@ -239,6 +262,8 @@ def _validate_success_contract(result: EpisodeResult) -> None:
 
 def _validate_step_records(
     records: list[StepRecord],
+    *,
+    status: str,
 ) -> tuple[dict[str, int], float, bool]:
     counts = {
         "parse_failures": 0,
@@ -268,7 +293,13 @@ def _validate_step_records(
             raise ValueError(
                 f"{prefix}.action_index must be a nonnegative integer"
             )
-        if record.reward is not None:
+        if record.reward is None:
+            if status != "error" or index != len(records) - 1:
+                raise ValueError(
+                    f"{prefix}.reward may be None only for "
+                    "status='error' on the final record"
+                )
+        else:
             _validate_step_number(
                 record.reward,
                 f"{prefix}.reward",
@@ -542,11 +573,17 @@ def _publish_staged_directory(
             out.rmdir()
             removed_empty_target = True
         os.replace(staging, out)
-        _fsync_directory(out.parent)
     except Exception:
         if removed_empty_target and not out.exists():
             out.mkdir()
         raise
+    try:
+        _fsync_directory(out.parent)
+    except Exception as exc:
+        raise ArtifactPublicationError(
+            out,
+            published=True,
+        ) from exc
 
 
 def write_outputs(
