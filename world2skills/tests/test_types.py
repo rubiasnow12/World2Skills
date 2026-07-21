@@ -73,6 +73,32 @@ def test_steprecord_from_decision_and_json():
     json.dumps(asdict(rec))
 
 
+def test_steprecord_copies_available_primitives():
+    dr = DecisionResult(
+        primitive="accelerate",
+        backend_action="FASTER",
+        action_index=3,
+        request_hash="abc",
+        raw_response='{"primitive": "accelerate"}',
+        cache_hit=False,
+        latency_ms=12.0,
+        decision_status="ok",
+        fallback_reason=None,
+        available_primitives=["accelerate", "maintain-speed"],
+    )
+
+    rec = StepRecord.from_decision(
+        dr,
+        t=0,
+        obs_summary="ego...",
+        reward=1.0,
+        crashed=False,
+    )
+    dr.available_primitives.append("decelerate")
+
+    assert rec.available_primitives == ["accelerate", "maintain-speed"]
+
+
 def test_episode_result_defaults_json():
     er = EpisodeResult(
         seed=0,

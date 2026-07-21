@@ -113,7 +113,7 @@ class StepRecord:
             latency_ms=dr.latency_ms,
             decision_status=dr.decision_status,
             fallback_reason=dr.fallback_reason,
-            available_primitives=dr.available_primitives,
+            available_primitives=dr.available_primitives.copy(),
         )
 
 
