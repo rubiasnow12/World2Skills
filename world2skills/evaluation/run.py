@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit, urlunsplit
 
 import yaml
 
@@ -447,7 +447,11 @@ def _redact_secrets(text: str) -> str:
             redacted = redacted.replace(value, _REDACTION)
         else:
             redacted = re.sub(
-                rf"(?<![A-Za-z0-9]){re.escape(value)}(?![A-Za-z0-9])",
+                (
+                    rf"(?<![A-Za-z0-9._-])"
+                    rf"{re.escape(value)}"
+                    rf"(?![A-Za-z0-9._-])"
+                ),
                 _REDACTION,
                 redacted,
             )
@@ -483,6 +487,7 @@ def _secret_variants(name: str, value: str) -> set[str]:
             if query_value and _sensitive_query_name(query_name):
                 variants.add(query_value)
                 variants.add(unquote(query_value))
+        variants.update(_raw_sensitive_query_variants(parsed.query))
         variants.update(_endpoint_path_variants(name, value))
     return {variant for variant in variants if _informative_secret_variant(variant)}
 
@@ -500,16 +505,26 @@ def _endpoint_path_variants(name: str, value: str) -> set[str]:
 
     decoded_path = unquote(path)
     variants = {path, decoded_path}
+    variants.update(segment for segment in path.split("/") if segment)
     variants.update(segment for segment in decoded_path.split("/") if segment)
     return {variant for variant in variants if _informative_secret_variant(variant)}
 
 
+def _raw_sensitive_query_variants(query: str) -> set[str]:
+    variants: set[str] = set()
+    for raw_pair in query.split("&"):
+        raw_name, separator, raw_value = raw_pair.partition("=")
+        if separator and raw_value and _sensitive_query_name(unquote_plus(raw_name)):
+            variants.add(raw_value)
+            variants.add(unquote_plus(raw_value))
+    return {variant for variant in variants if _informative_secret_variant(variant)}
+
+
 def _informative_secret_variant(value: str) -> bool:
-    return (
-        len(value) >= 3
-        and bool(re.search(r"[A-Za-z0-9]", value))
-        and value not in {"http://", "https://"}
-    )
+    return bool(re.search(r"[A-Za-z0-9]", value)) and value not in {
+        "http://",
+        "https://",
+    }
 
 
 def _sensitive_query_name(name: str) -> bool:

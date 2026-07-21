@@ -768,6 +768,23 @@ def test_single_character_token_does_not_corrupt_model_or_versions(
     assert config["installed_versions"]["gymnasium"] == "1.3.0"
 
 
+def test_one_and_two_character_secrets_use_strict_identifier_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TOKEN", "5")
+    monkeypatch.setenv("PASSWORD", "xy")
+    monkeypatch.setenv("PUNCT_SECRET", "/")
+
+    redacted = run._redact_secrets(
+        "standalone 5 xy; model gpt-5.4 version 1.3.0 identifier foo_xy_bar slash /"
+    )
+
+    assert redacted == (
+        "standalone <redacted> <redacted>; model gpt-5.4 "
+        "version 1.3.0 identifier foo_xy_bar slash /"
+    )
+
+
 def test_short_sensitive_values_use_token_boundaries_in_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -847,19 +864,26 @@ def test_endpoint_path_variants_redact_standalone_but_preserve_larger_words(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     raw_path = "/api/path-secret-%58%59%5A"
+    raw_segment = "path-secret-%58%59%5A"
     decoded_path = "/api/path-secret-XYZ"
     segment = "path-secret-XYZ"
-    endpoint = f"https://example.test{raw_path}"
+    raw_query_value = "query%2Fsecret"
+    decoded_query_value = "query/secret"
+    endpoint = f"https://example.test{raw_path}?token={raw_query_value}"
     monkeypatch.setenv("OPENAI_BASE_URL", endpoint)
-    expected_hash = hashlib.sha256(raw_path.encode() + b"\0").hexdigest()[:16]
+    expected_hash = hashlib.sha256(
+        raw_path.encode() + b"\0" + f"token={raw_query_value}".encode()
+    ).hexdigest()[:16]
 
     redacted = run._redact_secrets(
-        f"error {raw_path} {decoded_path} {segment} "
+        f"error {raw_path} {raw_segment} {decoded_path} {segment} "
+        f"{raw_query_value} {decoded_query_value} "
         f"{segment}suffix unrelated {endpoint}"
     )
 
     assert redacted == (
-        "error <redacted> <redacted> <redacted> "
+        "error <redacted> <redacted> <redacted> <redacted> "
+        "<redacted> <redacted> "
         f"{segment}suffix unrelated "
         f"https://example.test/_path_sha256_{expected_hash}/"
     )
