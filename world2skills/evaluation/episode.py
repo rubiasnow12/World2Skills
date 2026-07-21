@@ -32,6 +32,8 @@ def _mean(values: Sequence[float]) -> float:
 
 
 def _observed_speed(info: Mapping[str, Any]) -> float:
+    if "speed" not in info:
+        raise ValueError("step info must contain speed")
     speed = info["speed"]
     if (
         isinstance(speed, bool)
@@ -42,10 +44,13 @@ def _observed_speed(info: Mapping[str, Any]) -> float:
     return float(speed)
 
 
-def _step_crashed(env: Any, info: Mapping[str, Any]) -> bool:
-    if "crashed" in info:
+def _step_crashed(env: Any, info: object) -> bool:
+    if isinstance(info, Mapping) and "crashed" in info:
         return bool(info["crashed"])
-    return bool(getattr(env.unwrapped.vehicle, "crashed", False))
+    try:
+        return bool(getattr(env.unwrapped.vehicle, "crashed", False))
+    except Exception:
+        return False
 
 
 def _termination_reason(
@@ -183,14 +188,20 @@ def _run_episode(
                 context,
                 available_primitives,
             )
+            if decision.decision_status == _PARSE_FALLBACK:
+                parse_failures += 1
+            elif decision.decision_status == _UNAVAILABLE_FALLBACK:
+                unavailable_action_attempts += 1
+            elif decision.decision_status == _LLM_ERROR_FALLBACK:
+                llm_errors += 1
 
             obs, reward, terminated, truncated, info = env.step(
                 decision.action_index
             )
             reward = float(reward)
-            if not isinstance(info, Mapping):
-                raise TypeError("env.step info must be a mapping")
+            episode_return += reward
             step_crashed = _step_crashed(env, info)
+            crashed = crashed or step_crashed
             records.append(
                 StepRecord.from_decision(
                     decision,
@@ -200,16 +211,10 @@ def _run_episode(
                     crashed=step_crashed,
                 )
             )
-            episode_return += reward
-            crashed = crashed or step_crashed
-            speeds.append(_observed_speed(info))
 
-            if decision.decision_status == _PARSE_FALLBACK:
-                parse_failures += 1
-            elif decision.decision_status == _UNAVAILABLE_FALLBACK:
-                unavailable_action_attempts += 1
-            elif decision.decision_status == _LLM_ERROR_FALLBACK:
-                llm_errors += 1
+            if not isinstance(info, Mapping):
+                raise TypeError("env.step info must be a mapping")
+            speeds.append(_observed_speed(info))
 
             prev_primitive = decision.primitive
             scenario.update(env, t)

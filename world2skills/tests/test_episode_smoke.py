@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -176,7 +177,7 @@ class _FakeEnv:
     def __init__(
         self,
         transitions: list[
-            tuple[np.ndarray, float, bool, bool, dict[str, Any]]
+            tuple[np.ndarray, float, bool, bool, Any]
         ],
         *,
         close_error: Exception | None = None,
@@ -192,13 +193,15 @@ class _FakeEnv:
     def step(
         self,
         action_index: int,
-    ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+    ) -> tuple[np.ndarray, float, bool, bool, Any]:
         del action_index
         transition = self._transitions[self._index]
         self._index += 1
-        self.unwrapped.vehicle.crashed = bool(
-            transition[4].get("crashed", False)
-        )
+        info = transition[4]
+        if isinstance(info, Mapping):
+            self.unwrapped.vehicle.crashed = bool(
+                info.get("crashed", False)
+            )
         return transition
 
     def close(self) -> None:
@@ -406,6 +409,81 @@ def test_error_after_step_preserves_partial_metrics_and_record() -> None:
     assert len(result.step_records) == 1
     assert result.step_records[0].reward == pytest.approx(2.5)
     assert result.step_records[0].crashed is True
+    assert "Available primitives:" in result.step_records[0].obs_summary
+    assert env.close_calls == 1
+
+
+def test_non_mapping_info_preserves_completed_step_accounting() -> None:
+    env = _FakeEnv(
+        [
+            (
+                _OBSERVATION.copy(),
+                2.25,
+                True,
+                False,
+                ["not", "a", "mapping"],
+            )
+        ]
+    )
+    env.unwrapped.vehicle.crashed = True
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision("parse_fallback")]),
+        _FakeScenario(),
+        seed=0,
+        max_steps=2,
+    )
+
+    assert result.status == "error"
+    assert result.exception_type == "TypeError"
+    assert result.exception_message == "env.step info must be a mapping"
+    assert result.episode_return == pytest.approx(2.25)
+    assert result.mean_speed == 0.0
+    assert result.crashed is True
+    assert result.terminated is True
+    assert result.truncated is False
+    assert result.parse_failures == 1
+    assert result.steps == 1
+    assert result.step_records[0].reward == pytest.approx(2.25)
+    assert result.step_records[0].crashed is True
+    assert "Target:" in result.step_records[0].obs_summary
+    assert env.close_calls == 1
+
+
+def test_missing_speed_preserves_completed_step_accounting() -> None:
+    env = _FakeEnv(
+        [
+            (
+                _OBSERVATION.copy(),
+                1.75,
+                False,
+                True,
+                {"crashed": False},
+            )
+        ]
+    )
+
+    result = run_episode(
+        env,
+        _FakeExecutor([_decision("llm_error_fallback")]),
+        _FakeScenario(),
+        seed=0,
+        max_steps=2,
+    )
+
+    assert result.status == "error"
+    assert result.exception_type == "ValueError"
+    assert result.exception_message == "step info must contain speed"
+    assert result.episode_return == pytest.approx(1.75)
+    assert result.mean_speed == 0.0
+    assert result.crashed is False
+    assert result.terminated is False
+    assert result.truncated is True
+    assert result.llm_errors == 1
+    assert result.steps == 1
+    assert result.step_records[0].reward == pytest.approx(1.75)
+    assert result.step_records[0].crashed is False
     assert "Available primitives:" in result.step_records[0].obs_summary
     assert env.close_calls == 1
 
