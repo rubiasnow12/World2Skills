@@ -739,6 +739,35 @@ def test_short_sensitive_env_values_do_not_corrupt_snapshot_metadata(
     assert config["source_config"]["path"].startswith("/")
 
 
+@pytest.mark.parametrize("token", ["5", "0"])
+def test_single_character_token_does_not_corrupt_model_or_versions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    token: str,
+) -> None:
+    monkeypatch.setenv("TOKEN", token)
+    _patch_fast_success(monkeypatch)
+    out = tmp_path / f"single-token-{token}"
+
+    assert (
+        run.main(
+            [
+                "--seeds",
+                "0",
+                "--model",
+                "gpt-5.4",
+                "--out",
+                str(out),
+            ]
+        )
+        == 0
+    )
+
+    config = _read_json(out / "config.json")
+    assert config["requested"]["model"] == "gpt-5.4"
+    assert config["installed_versions"]["gymnasium"] == "1.3.0"
+
+
 def test_short_sensitive_values_use_token_boundaries_in_artifacts(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -812,6 +841,28 @@ def test_short_sensitive_values_use_token_boundaries_in_artifacts(
     assert trace["fallback_reason"] == "error <redacted> xabc1234y"
     assert trace["obs_summary"] == "step <redacted> shortfall /tmp/<redacted>"
     assert config["source_config"]["path"].startswith("/")
+
+
+def test_endpoint_path_variants_redact_standalone_but_preserve_larger_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw_path = "/api/path-secret-%58%59%5A"
+    decoded_path = "/api/path-secret-XYZ"
+    segment = "path-secret-XYZ"
+    endpoint = f"https://example.test{raw_path}"
+    monkeypatch.setenv("OPENAI_BASE_URL", endpoint)
+    expected_hash = hashlib.sha256(raw_path.encode() + b"\0").hexdigest()[:16]
+
+    redacted = run._redact_secrets(
+        f"error {raw_path} {decoded_path} {segment} "
+        f"{segment}suffix unrelated {endpoint}"
+    )
+
+    assert redacted == (
+        "error <redacted> <redacted> <redacted> "
+        f"{segment}suffix unrelated "
+        f"https://example.test/_path_sha256_{expected_hash}/"
+    )
 
 
 def test_exception_url_keeps_origin_and_hash_without_plaintext_components() -> None:

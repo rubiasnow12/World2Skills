@@ -437,11 +437,13 @@ def _exception_text(error: Exception | None) -> str | None:
 def _redact_secrets(text: str) -> str:
     redacted = _URL.sub(_redact_url_match, str(text))
     variants: set[str] = set()
+    boundary_only: set[str] = set()
     for name, value in os.environ.items():
         if value and any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS):
             variants.update(_secret_variants(name, value))
+            boundary_only.update(_endpoint_path_variants(name, value))
     for value in sorted(variants, key=len, reverse=True):
-        if len(value) >= 8:
+        if len(value) >= 8 and value not in boundary_only:
             redacted = redacted.replace(value, _REDACTION)
         else:
             redacted = re.sub(
@@ -481,14 +483,33 @@ def _secret_variants(name: str, value: str) -> set[str]:
             if query_value and _sensitive_query_name(query_name):
                 variants.add(query_value)
                 variants.add(unquote(query_value))
+        variants.update(_endpoint_path_variants(name, value))
+    return {variant for variant in variants if _informative_secret_variant(variant)}
+
+
+def _endpoint_path_variants(name: str, value: str) -> set[str]:
+    env_name = name.upper()
+    if "BASE_URL" not in env_name and "ENDPOINT" not in env_name:
+        return set()
+    try:
+        path = urlsplit(value).path
+    except ValueError:
+        return set()
+    if not path:
+        return set()
+
+    decoded_path = unquote(path)
+    variants = {path, decoded_path}
+    variants.update(segment for segment in decoded_path.split("/") if segment)
     return {variant for variant in variants if _informative_secret_variant(variant)}
 
 
 def _informative_secret_variant(value: str) -> bool:
-    return bool(re.search(r"[A-Za-z0-9]", value)) and value not in {
-        "http://",
-        "https://",
-    }
+    return (
+        len(value) >= 3
+        and bool(re.search(r"[A-Za-z0-9]", value))
+        and value not in {"http://", "https://"}
+    )
 
 
 def _sensitive_query_name(name: str) -> bool:
