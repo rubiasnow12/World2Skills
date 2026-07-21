@@ -18,6 +18,7 @@ _BACKEND = "highway-env"
 _ACTION_TYPE = "DiscreteMetaAction"
 _OBSERVATION_TYPE = "Kinematics"
 _DEFAULT_OBS_VEHICLES_COUNT = 8
+_RENDERER_REQUIRED_FEATURES = ("presence", "x", "y", "vx", "vy")
 
 
 def _validate_grounding(grounding: Grounding) -> list[str]:
@@ -47,6 +48,23 @@ def _validate_grounding(grounding: Grounding) -> list[str]:
             "grounding Kinematics features must be a non-empty list of "
             "unique, non-empty strings"
         )
+
+    missing_features = [
+        feature
+        for feature in _RENDERER_REQUIRED_FEATURES
+        if feature not in features
+    ]
+    if missing_features:
+        raise ValueError(
+            "grounding Kinematics features are missing renderer-required "
+            f"features: {missing_features}"
+        )
+
+    if (
+        not isinstance(grounding.backend_version, str)
+        or not grounding.backend_version.strip()
+    ):
+        raise ValueError("grounding backend_version must be a non-empty string")
 
     try:
         specifier = SpecifierSet(grounding.backend_version)
@@ -181,6 +199,7 @@ def make_env(
             render_mode=None,
         )
         obs, _ = env.reset(seed=seed)
+        # This seeds only the action space created by the factory's initial reset.
         env.action_space.seed(seed)
 
         expected_shape = (

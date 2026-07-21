@@ -152,6 +152,38 @@ def test_make_env_rejects_invalid_grounding_contract(
         make_env(invalid, scenario_config, seed=0)
 
 
+@pytest.mark.parametrize("backend_version", ["", "   ", None, 1])
+def test_make_env_requires_non_empty_string_backend_version(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+    backend_version: object,
+) -> None:
+    invalid = replace(grounding, backend_version=backend_version)
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        make_env(invalid, scenario_config, seed=0)
+
+
+@pytest.mark.parametrize("missing_feature", ["presence", "x", "y", "vx", "vy"])
+def test_make_env_requires_all_renderer_kinematics_features(
+    grounding: Grounding,
+    scenario_config: dict[str, Any],
+    missing_feature: str,
+) -> None:
+    features = [
+        feature
+        for feature in grounding.observation["features"]
+        if feature != missing_feature
+    ]
+    invalid = replace(
+        grounding,
+        observation={**grounding.observation, "features": features},
+    )
+
+    with pytest.raises(ValueError, match=missing_feature):
+        make_env(invalid, scenario_config, seed=0)
+
+
 @pytest.mark.parametrize("value", [0, -1, 1.5, True, None, "8"])
 def test_make_env_rejects_non_positive_integer_observation_count(
     grounding: Grounding,
