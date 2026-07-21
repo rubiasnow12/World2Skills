@@ -441,7 +441,14 @@ def _redact_secrets(text: str) -> str:
         if value and any(marker in name.upper() for marker in _SENSITIVE_ENV_MARKERS):
             variants.update(_secret_variants(name, value))
     for value in sorted(variants, key=len, reverse=True):
-        redacted = redacted.replace(value, _REDACTION)
+        if len(value) >= 8:
+            redacted = redacted.replace(value, _REDACTION)
+        else:
+            redacted = re.sub(
+                rf"(?<![A-Za-z0-9]){re.escape(value)}(?![A-Za-z0-9])",
+                _REDACTION,
+                redacted,
+            )
     redacted = _BEARER.sub(f"Bearer {_REDACTION}", redacted)
     redacted = _SK_KEY.sub(_REDACTION, redacted)
     return redacted
@@ -478,7 +485,10 @@ def _secret_variants(name: str, value: str) -> set[str]:
 
 
 def _informative_secret_variant(value: str) -> bool:
-    return len(value) >= 8 and value not in {"/", "http://", "https://"}
+    return bool(re.search(r"[A-Za-z0-9]", value)) and value not in {
+        "http://",
+        "https://",
+    }
 
 
 def _sensitive_query_name(name: str) -> bool:

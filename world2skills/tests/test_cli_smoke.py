@@ -739,6 +739,81 @@ def test_short_sensitive_env_values_do_not_corrupt_snapshot_metadata(
     assert config["source_config"]["path"].startswith("/")
 
 
+def test_short_sensitive_values_use_token_boundaries_in_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("API_KEY", "short")
+    monkeypatch.setenv("TOKEN", "abc1234")
+    monkeypatch.setenv("PATH_SECRET", "/")
+    _patch_fast_success(monkeypatch)
+
+    def short_secret_episode(
+        env: _FakeEnv,
+        executor: Any,
+        scenario: Any,
+        seed: int,
+        max_steps: int,
+    ) -> EpisodeResult:
+        del executor, scenario, max_steps
+        env.close()
+        step = StepRecord(
+            t=0,
+            obs_summary="step short shortfall /tmp/abc1234",
+            primitive="maintain-speed",
+            backend_action="IDLE",
+            action_index=1,
+            reward=0.0,
+            crashed=False,
+            request_hash="request-hash",
+            raw_response="provider short shortfall",
+            cache_hit=False,
+            latency_ms=1.0,
+            decision_status="parse_fallback",
+            fallback_reason="error abc1234 xabc1234y",
+            available_primitives=["maintain-speed"],
+        )
+        return EpisodeResult(
+            seed=seed,
+            status="ok",
+            success=False,
+            success_reason="",
+            episode_return=0.0,
+            crashed=False,
+            steps=1,
+            mean_speed=0.0,
+            parse_failures=1,
+            unavailable_action_attempts=0,
+            llm_errors=0,
+            terminated=False,
+            truncated=False,
+            max_steps_reached=True,
+            scenario_completed=False,
+            termination_reason="max_steps",
+            target_initially_ahead=False,
+            lane_change_completed_step=None,
+            overtake_step=None,
+            exception_message="setup short shortfall",
+            cleanup_error="provider abc1234 xabc1234y",
+            step_records=[step],
+        )
+
+    monkeypatch.setattr(run, "run_episode", short_secret_episode)
+    out = tmp_path / "short-token-boundaries"
+
+    assert run.main(["--seeds", "0", "--mock", "--out", str(out)]) == 0
+
+    result = _read_json(out / "results.json")["results"][0]
+    trace = json.loads((out / "episode_0.jsonl").read_text(encoding="utf-8"))
+    config = _read_json(out / "config.json")
+    assert result["exception_message"] == "setup <redacted> shortfall"
+    assert result["cleanup_error"] == "provider <redacted> xabc1234y"
+    assert trace["raw_response"] == "provider <redacted> shortfall"
+    assert trace["fallback_reason"] == "error <redacted> xabc1234y"
+    assert trace["obs_summary"] == "step <redacted> shortfall /tmp/<redacted>"
+    assert config["source_config"]["path"].startswith("/")
+
+
 def test_exception_url_keeps_origin_and_hash_without_plaintext_components() -> None:
     raw_url = (
         "https://user:password@example.test/private/path"
