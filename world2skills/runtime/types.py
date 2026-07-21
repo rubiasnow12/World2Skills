@@ -148,6 +148,7 @@ class EpisodeResult:
     target_initially_ahead: bool
     lane_change_completed_step: int | None
     overtake_step: int | None
+    lead_initial_gap_m: float | None = None
     exception_type: str | None = None
     step_records: list[StepRecord] = field(default_factory=list)
 

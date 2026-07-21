@@ -143,6 +143,9 @@ def test_episode_result_defaults_json():
         target_initially_ahead=True,
         lane_change_completed_step=1,
         overtake_step=2,
+        lead_initial_gap_m=30.0,
     )
     assert er.exception_type is None and er.step_records == []
-    json.dumps(asdict(er))
+    payload = asdict(er)
+    assert payload["lead_initial_gap_m"] == 30.0
+    json.dumps(payload)
