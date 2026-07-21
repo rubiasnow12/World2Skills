@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 
+from diskcache import Lock as DiskCacheLock
 import httpx
 import openai
 import pytest
 
+import world2skills.runtime.llm as llm_module
 from world2skills.runtime.llm import (
     AzureResponsesClient,
     ChatResult,
@@ -705,6 +708,79 @@ def test_concurrent_identical_cache_misses_invoke_provider_once(tmp_path):
     assert sorted(result.cache_hit for result in results) == [False, True]
     assert results[0].request_hash == results[1].request_hash
     assert len(concurrent_create.calls) == 1
+
+
+def test_lock_lease_covers_timeout_retry_and_safety_budget():
+    provider = FakeOpenAIProvider(chat_outcomes=[])
+    client = OpenAIClient(
+        model="m",
+        use_cache=False,
+        timeout=2.0,
+        retry_delays=(1.0, 4.0),
+        lock_safety_margin=3.0,
+        client_factory=RecordingFactory(provider),
+    )
+
+    assert client.request_timeout == 2.0
+    assert client.lock_safety_margin == 3.0
+    assert client.lock_lease_seconds == pytest.approx(
+        3 * 2.0 + 1.0 + 4.0 + 3.0
+    )
+    client.close()
+
+
+def test_expired_stale_request_lock_recovers_with_finite_lease(
+    tmp_path,
+    monkeypatch,
+):
+    provider = FakeOpenAIProvider(chat_outcomes=[_chat_response("recovered")])
+    client = OpenAIClient(
+        model="m",
+        base_url="https://chat.test/v1",
+        use_cache=True,
+        cache_path=tmp_path / "cache",
+        timeout=0.02,
+        retry_delays=(),
+        lock_safety_margin=0.03,
+        client_factory=RecordingFactory(provider),
+    )
+    request_hash = make_request_hash(
+        client_type="OpenAIClient",
+        model="m",
+        api_type="openai",
+        base_url="https://chat.test/v1/",
+        api_version="",
+        effective_settings={"temperature": 0.0},
+        messages=MESSAGES,
+        prompt_version="pv",
+    )
+    lock_key = ("world2skills.llm.request", request_hash)
+    assert client._cache is not None
+    stale_lock = DiskCacheLock(
+        client._cache,
+        lock_key,
+        expire=client.lock_lease_seconds,
+    )
+    stale_lock.acquire()
+
+    observed_expirations: list[float | None] = []
+    real_lock = llm_module.Lock
+
+    def recording_lock(cache, key, expire=None, tag=None):
+        observed_expirations.append(expire)
+        return real_lock(cache, key, expire=expire, tag=tag)
+
+    monkeypatch.setattr(llm_module, "Lock", recording_lock)
+    started_at = time.perf_counter()
+
+    result = client.chat(MESSAGES, prompt_version="pv")
+
+    elapsed = time.perf_counter() - started_at
+    client.close()
+    assert result.reply == "recovered"
+    assert elapsed < 1.0
+    assert observed_expirations == [client.lock_lease_seconds]
+    assert len(provider.chat_create.calls) == 1
 
 
 def test_close_is_idempotent(tmp_path):

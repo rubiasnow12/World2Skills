@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -27,6 +28,7 @@ DEFAULT_RETRY_DELAYS = (5, 10, 30)
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_AZURE_PROXY_URL = "http://127.0.0.1:8765/openai/"
 DEFAULT_AZURE_API_VERSION = "2025-04-01-preview"
+DEFAULT_LOCK_SAFETY_MARGIN = 30.0
 
 
 @dataclass(frozen=True)
@@ -216,7 +218,9 @@ class _CachedOpenAIClient(LLMClient):
         api_version: str,
         use_cache: bool,
         cache_path: str | os.PathLike[str] | None,
+        request_timeout: float,
         retry_delays: Sequence[float],
+        lock_safety_margin: float,
         sleeper: Callable[[float], None],
         clock: Callable[[], float],
     ):
@@ -225,7 +229,27 @@ class _CachedOpenAIClient(LLMClient):
         self._api_type = api_type
         self._base_url = _canonicalize_base_url(base_url)
         self._api_version = api_version
-        self.retry_delays = tuple(retry_delays)
+        self._request_timeout = float(request_timeout)
+        self.retry_delays = tuple(float(delay) for delay in retry_delays)
+        self._lock_safety_margin = float(lock_safety_margin)
+        if not math.isfinite(self._request_timeout) or self._request_timeout <= 0:
+            raise ValueError("request_timeout must be finite and positive")
+        if any(
+            not math.isfinite(delay) or delay < 0
+            for delay in self.retry_delays
+        ):
+            raise ValueError("retry delays must be finite and non-negative")
+        if (
+            not math.isfinite(self._lock_safety_margin)
+            or self._lock_safety_margin <= 0
+        ):
+            raise ValueError("lock_safety_margin must be finite and positive")
+        attempt_count = len(self.retry_delays) + 1
+        self._lock_lease_seconds = (
+            attempt_count * self._request_timeout
+            + sum(self.retry_delays)
+            + self._lock_safety_margin
+        )
         self._sleeper = sleeper
         self._clock = clock
         self._cache: Cache | None = None
@@ -248,6 +272,18 @@ class _CachedOpenAIClient(LLMClient):
     @property
     def api_version(self) -> str:
         return self._api_version
+
+    @property
+    def request_timeout(self) -> float:
+        return self._request_timeout
+
+    @property
+    def lock_safety_margin(self) -> float:
+        return self._lock_safety_margin
+
+    @property
+    def lock_lease_seconds(self) -> float:
+        return self._lock_lease_seconds
 
     @abstractmethod
     def _effective_settings(self, settings: ModelSettings) -> dict[str, Any]:
@@ -326,7 +362,11 @@ class _CachedOpenAIClient(LLMClient):
 
         if self._cache is not None:
             lock_key = ("world2skills.llm.request", request_hash)
-            with Lock(self._cache, lock_key):
+            with Lock(
+                self._cache,
+                lock_key,
+                expire=self.lock_lease_seconds,
+            ):
                 if request_hash in self._cache:
                     return ChatResult(
                         reply=self._cache[request_hash],
@@ -405,6 +445,7 @@ class OpenAIClient(_CachedOpenAIClient):
         cache_path: str | os.PathLike[str] | None = None,
         timeout: float = 600.0,
         retry_delays: Sequence[float] = DEFAULT_RETRY_DELAYS,
+        lock_safety_margin: float = DEFAULT_LOCK_SAFETY_MARGIN,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.perf_counter,
         client_factory: Callable[..., Any] = OpenAI,
@@ -421,14 +462,16 @@ class OpenAIClient(_CachedOpenAIClient):
             api_version=api_version,
             use_cache=use_cache,
             cache_path=cache_path,
+            request_timeout=timeout,
             retry_delays=retry_delays,
+            lock_safety_margin=lock_safety_margin,
             sleeper=sleeper,
             clock=clock,
         )
         self._client = client_factory(
             api_key=api_key or os.getenv("OPENAI_API_KEY") or "EMPTY",
             base_url=self.base_url,
-            timeout=timeout,
+            timeout=self.request_timeout,
             max_retries=0,
         )
 
@@ -462,6 +505,7 @@ class AzureResponsesClient(_CachedOpenAIClient):
         cache_path: str | os.PathLike[str] | None = None,
         timeout: float = 600.0,
         retry_delays: Sequence[float] = DEFAULT_RETRY_DELAYS,
+        lock_safety_margin: float = DEFAULT_LOCK_SAFETY_MARGIN,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.perf_counter,
         client_factory: Callable[..., Any] = OpenAI,
@@ -483,7 +527,9 @@ class AzureResponsesClient(_CachedOpenAIClient):
             api_version=resolved_api_version,
             use_cache=use_cache,
             cache_path=cache_path,
+            request_timeout=timeout,
             retry_delays=retry_delays,
+            lock_safety_margin=lock_safety_margin,
             sleeper=sleeper,
             clock=clock,
         )
@@ -491,7 +537,7 @@ class AzureResponsesClient(_CachedOpenAIClient):
             api_key=api_key or os.getenv("OPENAI_API_KEY") or "EMPTY",
             base_url=self.base_url,
             default_query={"api-version": resolved_api_version},
-            timeout=timeout,
+            timeout=self.request_timeout,
             max_retries=0,
         )
 
