@@ -1,0 +1,11 @@
+# M1 lane-change-overtake experiment defaults.
+skill: lane-change-overtake
+backend: highway-env
+prompt_version: lco-v1
+max_steps: 40
+scenario:
+  success_margin: 5.0
+  lead_speed_ratio: 0.6
+  target_lane_front_clearance_m: 20.0
+  target_lane_rear_clearance_m: 20.0
+  spawn_gap: 30.0
