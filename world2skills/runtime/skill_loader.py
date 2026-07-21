@@ -22,6 +22,7 @@ REQUIRED_HEADINGS = (
     "## Reasoning cues",
     "## Failure modes & recovery",
 )
+OPTIONAL_FINAL_HEADING = "## References"
 _SKILL_ID_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _LEVEL_TWO_HEADING = re.compile(r"^##(?:\s|$)")
 
@@ -77,10 +78,15 @@ def _validate_headings(body: str) -> None:
         for line in body.splitlines()
         if _LEVEL_TWO_HEADING.match(line)
     ]
-    if headings != list(REQUIRED_HEADINGS):
+    allowed_headings = (
+        list(REQUIRED_HEADINGS),
+        [*REQUIRED_HEADINGS, OPTIONAL_FINAL_HEADING],
+    )
+    if headings not in allowed_headings:
         raise ValueError(
-            "SKILL.md required headings must be exactly: "
-            + ", ".join(REQUIRED_HEADINGS)
+            "SKILL.md required headings must be exactly "
+            f"{list(REQUIRED_HEADINGS)!r}, optionally followed by "
+            f"{OPTIONAL_FINAL_HEADING!r}"
         )
 
 
@@ -155,8 +161,14 @@ def load_skill(skill_id: str, skills_dir: Path = SKILLS_DIR) -> SkillCard:
     ]
 
     return SkillCard(
+        schema_version=data["schema_version"],
         name=data["name"],
+        version=data["version"],
+        domain=data["domain"],
+        category=data["category"],
+        tags=data.get("tags", []),
         description=data["description"],
+        entities=data["entities"],
         skill_md_body=body,
         parameters=data.get("parameters", {}),
         interface=data["interface"],
@@ -168,6 +180,7 @@ def load_skill(skill_id: str, skills_dir: Path = SKILLS_DIR) -> SkillCard:
         safety_constraints=data["safety_constraints"],
         failure_modes=data["failure_modes"],
         termination=data["termination"],
+        related_skills=data.get("related_skills", []),
         groundings=groundings,
         primitives=_ordered_primitives(data["interface"]),
     )

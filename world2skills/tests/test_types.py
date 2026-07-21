@@ -20,8 +20,17 @@ def test_grounding_and_skill_card_json_contract():
         primitive_map={"accelerate": "FASTER"},
     )
     skill = SkillCard(
+        schema_version="0.1",
         name="lane-change-overtake",
+        version="1.0",
+        domain="autonomous-driving",
+        category="lateral",
+        tags=["overtake", "lane-change"],
         description="Overtake a slower lead vehicle.",
+        entities=[
+            {"name": "ego", "role": "controlled-vehicle"},
+            {"name": "lead_vehicle", "role": "traffic"},
+        ],
         skill_md_body="# Lane Change Overtake",
         parameters={"target_speed": {"default": 25}},
         interface={"actions": []},
@@ -33,6 +42,7 @@ def test_grounding_and_skill_card_json_contract():
         safety_constraints=["lane change only into an existing lane"],
         failure_modes=["changing into an occupied gap"],
         termination="ego passed the lead vehicle",
+        related_skills=["follow-keep-distance"],
         groundings=[grounding],
         primitives=["accelerate"],
     )
@@ -41,6 +51,13 @@ def test_grounding_and_skill_card_json_contract():
     skill_payload = asdict(skill)
 
     assert grounding_payload["backend_version"] == ">=1.8"
+    assert skill_payload["schema_version"] == "0.1"
+    assert skill_payload["version"] == "1.0"
+    assert skill_payload["domain"] == "autonomous-driving"
+    assert skill_payload["category"] == "lateral"
+    assert skill_payload["tags"] == ["overtake", "lane-change"]
+    assert skill_payload["entities"][1]["name"] == "lead_vehicle"
+    assert skill_payload["related_skills"] == ["follow-keep-distance"]
     assert skill_payload["success_criteria"] == ["ego overtook the lead vehicle"]
     assert skill_payload["failure_criteria"] == ["collision == true"]
     assert skill_payload["safety_constraints"] == [

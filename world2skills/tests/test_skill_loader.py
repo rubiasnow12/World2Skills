@@ -70,6 +70,12 @@ def test_loads_all_skills_and_preserves_required_fields(skill_id: str):
     assert card.name == skill_id
     assert card.description == source["description"]
     for field_name in (
+        "schema_version",
+        "version",
+        "domain",
+        "category",
+        "tags",
+        "entities",
         "parameters",
         "interface",
         "execution",
@@ -80,6 +86,7 @@ def test_loads_all_skills_and_preserves_required_fields(skill_id: str):
         "safety_constraints",
         "failure_modes",
         "termination",
+        "related_skills",
     ):
         assert getattr(card, field_name) == source[field_name]
     assert [asdict(grounding) for grounding in card.groundings] == source["groundings"]
@@ -170,15 +177,34 @@ def test_rejects_non_mapping_frontmatter(tmp_path: Path):
         load_skill("lane-change-overtake", skills_dir=skills_dir)
 
 
+def test_accepts_optional_final_references_heading(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    md_path = skill_dir / "SKILL.md"
+    md_path.write_text(
+        md_path.read_text(encoding="utf-8")
+        + "\n## References\n"
+        + "- HighwayEnv documentation\n",
+        encoding="utf-8",
+    )
+
+    card = load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+    assert card.skill_md_body.rstrip().endswith(
+        "## References\n- HighwayEnv documentation"
+    )
+
+
 @pytest.mark.parametrize(
     ("source", "replacement"),
     [
         ("## When to use", "## When to use this skill"),
         ("## Failure modes & recovery", "## Failure modes"),
+        ("## Reasoning cues\n", ""),
         ("## Procedure", "## Procedure\n\n## Extra section"),
+        ("## Procedure", "## References\n\n## Procedure"),
     ],
 )
-def test_rejects_missing_changed_or_extra_level_two_heading(
+def test_rejects_missing_changed_or_extra_or_nonfinal_level_two_heading(
     tmp_path: Path,
     source: str,
     replacement: str,
@@ -189,6 +215,19 @@ def test_rejects_missing_changed_or_extra_level_two_heading(
         md_path.read_text(encoding="utf-8").replace(source, replacement),
         encoding="utf-8",
     )
+
+    with pytest.raises(ValueError, match="required headings"):
+        load_skill("lane-change-overtake", skills_dir=skills_dir)
+
+
+def test_rejects_reordered_required_headings(tmp_path: Path):
+    skills_dir, skill_dir = _copy_skill(tmp_path)
+    md_path = skill_dir / "SKILL.md"
+    text = md_path.read_text(encoding="utf-8")
+    text = text.replace("## When to use", "## TEMP", 1)
+    text = text.replace("## Procedure", "## When to use", 1)
+    text = text.replace("## TEMP", "## Procedure", 1)
+    md_path.write_text(text, encoding="utf-8")
 
     with pytest.raises(ValueError, match="required headings"):
         load_skill("lane-change-overtake", skills_dir=skills_dir)

@@ -22,8 +22,14 @@ class Grounding:
 
 @dataclass
 class SkillCard:
+    schema_version: str
     name: str
+    version: str
+    domain: str
+    category: str
+    tags: list[str]
     description: str
+    entities: list[dict[str, Any]]
     skill_md_body: str
     parameters: dict[str, Any]
     interface: dict[str, Any]
@@ -35,6 +41,7 @@ class SkillCard:
     safety_constraints: list[str]
     failure_modes: list[str]
     termination: str
+    related_skills: list[str]
     groundings: list[Grounding]
     primitives: list[str]
 
