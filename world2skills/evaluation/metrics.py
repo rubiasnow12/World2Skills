@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 import math
+from numbers import Real
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any
 
@@ -15,6 +17,29 @@ from ..runtime.types import BatchResult, EpisodeResult
 
 SCHEMA_VERSION = "0.1"
 _VALID_STATUSES = frozenset({"ok", "error"})
+_BOOLEAN_FIELDS = (
+    "success",
+    "crashed",
+    "terminated",
+    "truncated",
+    "max_steps_reached",
+    "scenario_completed",
+)
+_NONNEGATIVE_INTEGER_FIELDS = (
+    "steps",
+    "parse_failures",
+    "unavailable_action_attempts",
+    "llm_errors",
+)
+_OPTIONAL_NONNEGATIVE_INTEGER_FIELDS = (
+    "lane_change_completed_step",
+    "overtake_step",
+)
+_FINITE_NUMBER_FIELDS = (
+    "episode_return",
+    "mean_speed",
+)
+_OPTIONAL_FINITE_NUMBER_FIELDS = ("lead_initial_gap_m",)
 
 
 def episode_to_result_dict(result: EpisodeResult) -> dict[str, Any]:
@@ -72,7 +97,48 @@ def _ordered_results(
             raise ValueError(
                 "episode status must be exactly 'ok' or 'error'"
             )
+        _validate_episode_summary(result)
     return ordered
+
+
+def _validate_episode_summary(result: EpisodeResult) -> None:
+    for field_name in _BOOLEAN_FIELDS:
+        if type(getattr(result, field_name)) is not bool:
+            raise ValueError(f"{field_name} must be bool")
+
+    for field_name in _NONNEGATIVE_INTEGER_FIELDS:
+        value = getattr(result, field_name)
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"{field_name} must be a nonnegative integer"
+            )
+
+    for field_name in _OPTIONAL_NONNEGATIVE_INTEGER_FIELDS:
+        value = getattr(result, field_name)
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError(
+                f"{field_name} must be a nonnegative integer or None"
+            )
+
+    for field_name in _FINITE_NUMBER_FIELDS:
+        _validate_finite_number(getattr(result, field_name), field_name)
+
+    for field_name in _OPTIONAL_FINITE_NUMBER_FIELDS:
+        value = getattr(result, field_name)
+        if value is not None:
+            _validate_finite_number(value, field_name)
+
+    if result.status == "error" and result.success:
+        raise ValueError("error episode cannot report success")
+
+
+def _validate_finite_number(value: object, field_name: str) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, Real)
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"{field_name} must be a finite number")
 
 
 def _strict_json(
@@ -157,39 +223,59 @@ def _validate_batch_results(
 ) -> list[EpisodeResult]:
     if not isinstance(batch, BatchResult):
         raise TypeError("batch must be a BatchResult")
-    validated_seeds = _validate_seeds(batch.seeds)
-    ordered = _ordered_results(results, validated_seeds)
-    expected_summaries = [
-        episode_to_result_dict(result) for result in ordered
-    ]
-    if batch.results != expected_summaries:
+    expected = aggregate(
+        results,
+        model=batch.model,
+        prompt_version=batch.prompt_version,
+        skill=batch.skill,
+        environment=batch.environment,
+        seeds=batch.seeds,
+    )
+    if asdict(batch) != asdict(expected):
         raise ValueError(
-            "batch results are inconsistent with episode result seed order"
+            "batch results are inconsistent with recomputed episode aggregates"
         )
-    return ordered
+    by_seed = {result.seed: result for result in results}
+    return [by_seed[seed] for seed in expected.seeds]
 
 
-def _atomic_write_text(path: Path, text: str) -> None:
-    temporary_path: Path | None = None
+def _write_staged_file(path: Path, text: str) -> None:
+    with path.open(
+        "x",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _require_absent_or_empty_directory(path: Path) -> bool:
+    if not path.exists():
+        return False
+    if path.is_symlink() or not path.is_dir():
+        raise ValueError("output path must be absent or an empty directory")
+    if next(path.iterdir(), None) is not None:
+        raise ValueError(
+            "output run directory is non-empty; expected empty or absent"
+        )
+    return True
+
+
+def _publish_staged_directory(
+    staging: Path,
+    out: Path,
+) -> None:
+    removed_empty_target = False
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary_path = Path(handle.name)
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        temporary_path = None
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        if _require_absent_or_empty_directory(out):
+            out.rmdir()
+            removed_empty_target = True
+        os.replace(staging, out)
+    except Exception:
+        if removed_empty_target and not out.exists():
+            out.mkdir()
+        raise
 
 
 def write_outputs(
@@ -221,11 +307,26 @@ def write_outputs(
         )
 
     out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(out / "results.json", results_text)
-    _atomic_write_text(out / "config.json", config_text)
-    for seed in batch.seeds:
-        _atomic_write_text(
-            out / f"episode_{seed}.jsonl",
-            trace_texts[seed],
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _require_absent_or_empty_directory(out)
+
+    staging: Path | None = Path(
+        tempfile.mkdtemp(
+            dir=out.parent,
+            prefix=f".{out.name}.staging-",
         )
+    )
+    try:
+        assert staging is not None
+        _write_staged_file(staging / "results.json", results_text)
+        _write_staged_file(staging / "config.json", config_text)
+        for seed in batch.seeds:
+            _write_staged_file(
+                staging / f"episode_{seed}.jsonl",
+                trace_texts[seed],
+            )
+        _publish_staged_directory(staging, out)
+        staging = None
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)

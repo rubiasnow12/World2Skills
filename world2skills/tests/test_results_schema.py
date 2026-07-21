@@ -208,19 +208,72 @@ def test_aggregate_rejects_invalid_episode_status(status: str) -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("episode_return", float("nan")),
-        ("episode_return", float("inf")),
-        ("mean_speed", float("-inf")),
-        ("lead_initial_gap_m", float("nan")),
+        ("success", 1),
+        ("crashed", 2),
+        ("terminated", 0),
+        ("truncated", "false"),
+        ("max_steps_reached", None),
+        ("scenario_completed", 1),
     ],
 )
-def test_aggregate_rejects_nonfinite_summary_numbers(
+def test_aggregate_rejects_nonboolean_summary_flags(
     field: str,
-    value: float,
+    value: object,
 ) -> None:
     episode = replace(_episode(0), **{field: value})
 
-    with pytest.raises(ValueError, match="finite|JSON"):
+    with pytest.raises(ValueError, match=rf"{field}.*bool"):
+        _batch([episode])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("steps", -1),
+        ("steps", 1.5),
+        ("parse_failures", True),
+        ("unavailable_action_attempts", -1),
+        ("llm_errors", 2.5),
+        ("lane_change_completed_step", -1),
+        ("overtake_step", True),
+    ],
+)
+def test_aggregate_rejects_invalid_nonnegative_integer_fields(
+    field: str,
+    value: object,
+) -> None:
+    episode = replace(_episode(0), **{field: value})
+
+    with pytest.raises(ValueError, match=rf"{field}.*nonnegative integer"):
+        _batch([episode])
+
+
+def test_aggregate_rejects_successful_error_episode() -> None:
+    episode = _episode(0, status="error", success=True)
+
+    with pytest.raises(ValueError, match="error.*success"):
+        _batch([episode])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("episode_return", float("nan")),
+        ("episode_return", float("inf")),
+        ("episode_return", True),
+        ("mean_speed", float("-inf")),
+        ("mean_speed", "fast"),
+        ("lead_initial_gap_m", float("nan")),
+        ("lead_initial_gap_m", False),
+    ],
+)
+def test_aggregate_rejects_invalid_summary_numbers(
+    field: str,
+    value: object,
+) -> None:
+    episode = replace(_episode(0), **{field: value})
+
+    with pytest.raises(ValueError, match=rf"{field}.*finite"):
         _batch([episode])
 
 
@@ -287,6 +340,31 @@ def test_write_outputs_rejects_batch_result_seed_inconsistency(
         write_outputs(tmp_path, batch, results, config={})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("requested_episodes", 99),
+        ("completed_episodes", 99),
+        ("success_rate", 0.75),
+        ("collision_rate", 0.75),
+        ("mean_return", 999.0),
+        ("schema_version", "mutated"),
+    ],
+)
+def test_write_outputs_rejects_mutated_batch(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    results = [_episode(0, success=True)]
+    batch = replace(_batch(results), **{field: value})
+
+    with pytest.raises(ValueError, match="batch"):
+        write_outputs(tmp_path, batch, results, config={})
+
+    assert not (tmp_path / "results.json").exists()
+
+
 def test_write_outputs_rejects_duplicate_episode_files(
     tmp_path: Path,
 ) -> None:
@@ -336,26 +414,75 @@ def test_write_outputs_rejects_nonfinite_trace_values(
     assert not (tmp_path / "episode_0.jsonl").exists()
 
 
-def test_atomic_replace_failure_preserves_existing_primary_file(
+def test_write_outputs_rejects_nonempty_run_dir_without_changes(
+    tmp_path: Path,
+) -> None:
+    results = [_episode(0)]
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / "results.json").write_bytes(b"old-results\n")
+    (out / "sentinel.bin").write_bytes(b"\x00\x01old")
+    before = {
+        path.name: path.read_bytes()
+        for path in out.iterdir()
+    }
+
+    with pytest.raises(ValueError, match="non-empty"):
+        write_outputs(out, _batch(results), results, config={})
+
+    after = {
+        path.name: path.read_bytes()
+        for path in out.iterdir()
+    }
+    assert after == before
+    assert list(tmp_path.glob(".run.staging-*")) == []
+
+
+def test_stage_failure_does_not_publish_partial_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from world2skills.evaluation import metrics
 
-    results = [_episode(0)]
-    target = tmp_path / "results.json"
-    target.write_text("old-results\n", encoding="utf-8")
-    real_replace = metrics.os.replace
+    results = [_episode(0, step_records=[_step()])]
+    out = tmp_path / "run"
+    real_write = getattr(metrics, "_write_staged_file", None)
+    calls = 0
 
-    def fail_results_replace(source: object, destination: object) -> None:
-        if Path(destination) == target:
-            raise OSError("replace failed")
-        real_replace(source, destination)
+    def fail_second_write(path: Path, text: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("stage write failed")
+        if real_write is not None:
+            real_write(path, text)
 
-    monkeypatch.setattr(metrics.os, "replace", fail_results_replace)
+    monkeypatch.setattr(
+        metrics,
+        "_write_staged_file",
+        fail_second_write,
+        raising=False,
+    )
 
-    with pytest.raises(OSError, match="replace failed"):
-        write_outputs(tmp_path, _batch(results), results, config={})
+    with pytest.raises(OSError, match="stage write failed"):
+        write_outputs(out, _batch(results), results, config={})
 
-    assert target.read_text(encoding="utf-8") == "old-results\n"
-    assert list(tmp_path.glob(".results.json.*.tmp")) == []
+    assert not out.exists()
+    assert list(tmp_path.glob(".run.staging-*")) == []
+
+
+def test_write_outputs_publishes_over_existing_empty_directory(
+    tmp_path: Path,
+) -> None:
+    results = [_episode(0, step_records=[_step()])]
+    out = tmp_path / "run"
+    out.mkdir()
+
+    write_outputs(out, _batch(results), results, config={"seed": 0})
+
+    assert sorted(path.name for path in out.iterdir()) == [
+        "config.json",
+        "episode_0.jsonl",
+        "results.json",
+    ]
+    assert json.loads((out / "config.json").read_text()) == {"seed": 0}
