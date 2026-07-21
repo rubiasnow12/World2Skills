@@ -10,6 +10,7 @@ from world2skills.runtime.executor import (
     NoAvailablePrimitiveError,
 )
 from world2skills.runtime.llm import (
+    ChatResult,
     LLMRequestError,
     MockLLMClient,
     ModelSettings,
@@ -467,10 +468,10 @@ class RaisingClient:
         self,
         error: Exception,
         *,
-        model: str = "failing-model",
-        api_type: str = "test-api",
-        base_url: str = "https://executor.test/v1",
-        api_version: str = "2026-07-21",
+        model: Any = "failing-model",
+        api_type: Any = "test-api",
+        base_url: Any = "https://executor.test/v1",
+        api_version: Any = "2026-07-21",
     ):
         self.error = error
         self.model = model
@@ -480,6 +481,52 @@ class RaisingClient:
 
     def chat(self, *_args, **_kwargs):
         raise self.error
+
+
+class ReturningClient:
+    def __init__(
+        self,
+        request_hash: Any,
+        *,
+        model: Any = "returning-model",
+        api_type: Any = "test-api",
+        base_url: Any = "https://executor.test/v1",
+        api_version: Any = "2026-07-21",
+    ):
+        self.request_hash = request_hash
+        self.model = model
+        self.api_type = api_type
+        self.base_url = base_url
+        self.api_version = api_version
+
+    def chat(self, *_args, **_kwargs):
+        return ChatResult(
+            reply='{"primitive": "accelerate"}',
+            request_hash=self.request_hash,
+            cache_hit=False,
+            latency_ms=1.0,
+        )
+
+
+def _expected_local_hash(
+    executor: LLMSkillExecutor,
+    client: Any,
+    *,
+    observation: str = "observation",
+    allowed: list[str] | None = None,
+    model: str | None = None,
+) -> str:
+    allowed = allowed or ["accelerate"]
+    return make_request_hash(
+        client_type=type(client).__name__,
+        model=client.model if model is None else model,
+        api_type=client.api_type,
+        base_url=client.base_url,
+        api_version=client.api_version,
+        effective_settings=ModelSettings().for_chat_completions(),
+        messages=executor.build_messages(observation, allowed),
+        prompt_version="lco-v1",
+    )
 
 
 def test_llm_request_error_preserves_trace_identity_and_original_error():
@@ -505,21 +552,42 @@ def test_llm_request_error_preserves_trace_identity_and_original_error():
     assert result.fallback_reason == "TimeoutError: provider timed out"
 
 
+@pytest.mark.parametrize("bad_hash", ["", None])
+def test_chat_result_bad_hash_preserves_precomputed_local_hash(bad_hash: Any):
+    client = ReturningClient(bad_hash)
+    executor = _executor(client=client)
+    expected_hash = _expected_local_hash(executor, client)
+
+    result = executor.decide("observation", None, ["accelerate"])
+
+    assert result.decision_status == "ok"
+    assert result.request_hash == expected_hash
+
+
+@pytest.mark.parametrize("bad_hash", ["", None])
+def test_llm_request_error_bad_hash_preserves_precomputed_local_hash(
+    bad_hash: Any,
+):
+    error = LLMRequestError(
+        request_hash=bad_hash,
+        latency_ms=25.0,
+        original_exception=TimeoutError("provider timed out"),
+    )
+    client = RaisingClient(error)
+    executor = _executor(client=client)
+    expected_hash = _expected_local_hash(executor, client)
+
+    result = executor.decide("observation", None, ["accelerate"])
+
+    assert result.decision_status == "llm_error_fallback"
+    assert result.request_hash == expected_hash
+
+
 def test_generic_client_error_uses_local_audit_hash_and_fallback():
     client = RaisingClient(RuntimeError("provider exploded"))
     executor = _executor(client=client)
     allowed = ["accelerate"]
-    messages = executor.build_messages("observation", allowed)
-    expected_hash = make_request_hash(
-        client_type="RaisingClient",
-        model=client.model,
-        api_type=client.api_type,
-        base_url=client.base_url,
-        api_version=client.api_version,
-        effective_settings=ModelSettings().for_chat_completions(),
-        messages=messages,
-        prompt_version="lco-v1",
-    )
+    expected_hash = _expected_local_hash(executor, client, allowed=allowed)
 
     result = executor.decide("observation", None, allowed)
 
@@ -531,6 +599,30 @@ def test_generic_client_error_uses_local_audit_hash_and_fallback():
     assert result.cache_hit is False
     assert result.latency_ms > 0
     assert result.fallback_reason == "RuntimeError: provider exploded"
+
+
+class ExplodingString:
+    def __str__(self):
+        raise RuntimeError("identity cannot be stringified")
+
+
+def test_unstringifiable_client_identity_uses_safe_deterministic_placeholder():
+    client = RaisingClient(
+        RuntimeError("provider exploded"),
+        model=ExplodingString(),
+    )
+    executor = _executor(client=client)
+    expected_hash = _expected_local_hash(
+        executor,
+        client,
+        model="<unavailable>",
+    )
+
+    result = executor.decide("observation", None, ["accelerate"])
+
+    assert result.decision_status == "llm_error_fallback"
+    assert result.request_hash == expected_hash
+    assert len(result.request_hash) == 64
 
 
 class FakeActionType:

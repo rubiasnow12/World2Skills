@@ -23,6 +23,7 @@ _FENCED_JSON = re.compile(
     r"\A```json[ \t]*(?:\r?\n)?(?P<body>\{.*\})(?:\r?\n)?```\Z",
     re.DOTALL,
 )
+_UNAVAILABLE_CLIENT_IDENTITY = "<unavailable>"
 
 
 class NoAvailablePrimitiveError(RuntimeError):
@@ -272,12 +273,14 @@ class LLMSkillExecutor:
                 self.prompt_version,
             )
             raw_response = _normalize_reply(result.reply)
-            request_hash = result.request_hash
+            if _is_nonempty_string(result.request_hash):
+                request_hash = result.request_hash
             cache_hit = result.cache_hit
             latency_ms = result.latency_ms
         except LLMRequestError as error:
             status = "llm_error_fallback"
-            request_hash = error.request_hash
+            if _is_nonempty_string(error.request_hash):
+                request_hash = error.request_hash
             latency_ms = error.latency_ms
             fallback_reason = _describe_exception(error.original_exception)
         except Exception as error:
@@ -348,9 +351,13 @@ def _describe_exception(error: Exception) -> str:
 def _client_identity(client: Any, attribute: str) -> str:
     try:
         value = getattr(client, attribute, "")
+        return "" if value is None else str(value)
     except Exception:
-        return ""
-    return "" if value is None else str(value)
+        return _UNAVAILABLE_CLIENT_IDENTITY
+
+
+def _is_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
 
 
 def _normalize_reply(reply: Any) -> str:
