@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 import json
 import re
-import time
 from typing import Any
 
 from .llm import LLMClient, LLMRequestError, Message, ModelSettings
@@ -37,12 +37,12 @@ class LLMSkillExecutor:
         prompt_version: str,
         name_to_index: Mapping[str, int],
     ):
-        self.skill_card = skill_card
-        self.grounding = grounding
+        self.skill_card = deepcopy(skill_card)
+        self.grounding = deepcopy(grounding)
         self.llm = llm_client
         self.prompt_version = prompt_version
-        self._primitives = tuple(skill_card.primitives)
-        self._primitive_map = dict(grounding.primitive_map)
+        self._primitives = tuple(self.skill_card.primitives)
+        self._primitive_map = dict(self.grounding.primitive_map)
         self._name_to_index = dict(name_to_index)
         self._validate_action_contract()
 
@@ -61,7 +61,10 @@ class LLMSkillExecutor:
                 + ", ".join(missing_primitives)
             )
 
-        backend_actions = list(self._primitive_map.values())
+        backend_actions = [
+            self._primitive_map[primitive]
+            for primitive in self._primitives
+        ]
         if any(
             not isinstance(name, str) or not name
             for name in backend_actions
@@ -69,8 +72,6 @@ class LLMSkillExecutor:
             raise ValueError(
                 "primitive_map backend actions must be non-empty strings"
             )
-        if len(set(backend_actions)) != len(backend_actions):
-            raise ValueError("primitive_map backend actions must be unique")
 
         if any(
             not isinstance(name, str) or not name
@@ -92,7 +93,7 @@ class LLMSkillExecutor:
 
         missing_backend_actions = [
             name
-            for name in backend_actions
+            for name in dict.fromkeys(backend_actions)
             if name not in self._name_to_index
         ]
         if missing_backend_actions:
@@ -187,7 +188,9 @@ class LLMSkillExecutor:
             Message(role="user", content=user),
         ]
 
-    def _parse_primitive(self, reply: str) -> tuple[str | None, str | None]:
+    def _parse_primitive(self, reply: Any) -> tuple[str | None, str | None]:
+        if not isinstance(reply, str):
+            return None, "response must be a string"
         text = reply.strip()
         fenced = _FENCED_JSON.fullmatch(text)
         payload = fenced.group("body") if fenced else text
@@ -243,7 +246,6 @@ class LLMSkillExecutor:
         request_hash = ""
         cache_hit = False
         latency_ms = 0.0
-        started = time.perf_counter()
 
         try:
             result = self.llm.chat(
@@ -260,10 +262,6 @@ class LLMSkillExecutor:
             request_hash = error.request_hash
             latency_ms = error.latency_ms
             fallback_reason = _describe_exception(error.original_exception)
-        except Exception as error:
-            status = "llm_error_fallback"
-            latency_ms = (time.perf_counter() - started) * 1000
-            fallback_reason = _describe_exception(error)
 
         if status == "ok":
             primitive, parse_error = self._parse_primitive(raw_response)

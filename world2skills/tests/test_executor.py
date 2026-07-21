@@ -40,7 +40,7 @@ def _skill_and_grounding():
 
 
 def _executor(
-    reply: str = '{"primitive": "maintain-speed"}',
+    reply: Any = '{"primitive": "maintain-speed"}',
     *,
     client: Any | None = None,
     name_to_index: dict[str, int] | None = None,
@@ -127,6 +127,19 @@ def test_malformed_unknown_or_non_exact_reply_uses_parse_fallback(reply: str):
     assert result.backend_action == "IDLE"
     assert result.action_index == 1
     assert result.fallback_reason
+
+
+def test_non_string_reply_uses_controlled_parse_fallback():
+    result = _executor(None).decide(
+        "observation",
+        None,
+        ALL_PRIMITIVES,
+    )
+
+    assert result.decision_status == "parse_fallback"
+    assert result.primitive == "maintain-speed"
+    assert result.raw_response is None
+    assert result.fallback_reason == "response must be a string"
 
 
 def test_valid_but_unavailable_primitive_uses_unavailable_fallback():
@@ -365,6 +378,77 @@ def test_constructor_copies_action_mappings():
     assert result.action_index == 3
 
 
+def test_constructor_allows_many_primitives_to_share_one_backend_action():
+    card, grounding = _skill_and_grounding()
+    grounding.primitive_map["change-lane-left"] = "IDLE"
+    executor = LLMSkillExecutor(
+        card,
+        grounding,
+        MockLLMClient(['{"primitive": "change-lane-left"}']),
+        "lco-v1",
+        NAME_TO_INDEX,
+    )
+
+    result = executor.decide(
+        "observation",
+        None,
+        ["change-lane-left"],
+    )
+
+    assert result.backend_action == "IDLE"
+    assert result.action_index == 1
+
+
+def test_constructor_ignores_unrelated_extra_primitive_mapping():
+    card, grounding = _skill_and_grounding()
+    grounding.primitive_map["runtime-diagnostic"] = "NOT_AN_ENV_ACTION"
+    executor = LLMSkillExecutor(
+        card,
+        grounding,
+        MockLLMClient(['{"primitive": "accelerate"}']),
+        "lco-v1",
+        NAME_TO_INDEX,
+    )
+
+    result = executor.decide("observation", None, ["accelerate"])
+
+    assert result.backend_action == "FASTER"
+    assert result.action_index == 3
+
+
+def test_constructor_deep_snapshots_skill_card_and_grounding():
+    card, grounding = _skill_and_grounding()
+    executor = LLMSkillExecutor(
+        card,
+        grounding,
+        MockLLMClient(['{"primitive": "accelerate"}']),
+        "lco-v1",
+        NAME_TO_INDEX,
+    )
+
+    card.skill_md_body = "MUTATED SKILL BODY"
+    card.effects[0] = "MUTATED EFFECT"
+    card.parameters["target_speed"]["default"] = 999
+    card.primitives[:] = ["teleport"]
+    grounding.action["type"] = "MUTATED ACTION TYPE"
+    grounding.primitive_map["accelerate"] = "IDLE"
+
+    messages = executor.build_messages("observation", ["accelerate"])
+    result = executor.decide("observation", None, ["accelerate"])
+    prompt = "\n".join(message.content for message in messages)
+
+    assert "# Lane Change Overtake" in prompt
+    assert "ego ahead of the previously blocking lead vehicle" in prompt
+    assert '"default": 25' in prompt
+    assert "MUTATED" not in prompt
+    assert result.decision_status == "ok"
+    assert result.backend_action == "FASTER"
+    assert result.action_index == 3
+    assert executor.skill_card is not card
+    assert executor.grounding is not grounding
+    assert executor.grounding.action["type"] == "DiscreteMetaAction"
+
+
 class RaisingClient:
     def __init__(self, error: Exception):
         self.error = error
@@ -396,22 +480,17 @@ def test_llm_request_error_preserves_trace_identity_and_original_error():
     assert result.fallback_reason == "TimeoutError: provider timed out"
 
 
-def test_generic_client_error_falls_back_with_useful_reason():
-    result = _executor(
+def test_generic_client_error_propagates_without_silent_fallback():
+    executor = _executor(
         client=RaisingClient(RuntimeError("provider exploded"))
-    ).decide(
-        "observation",
-        None,
-        ["accelerate"],
     )
 
-    assert result.decision_status == "llm_error_fallback"
-    assert result.primitive == "accelerate"
-    assert result.request_hash == ""
-    assert result.raw_response == ""
-    assert result.cache_hit is False
-    assert result.latency_ms >= 0
-    assert result.fallback_reason == "RuntimeError: provider exploded"
+    with pytest.raises(RuntimeError, match="provider exploded"):
+        executor.decide(
+            "observation",
+            None,
+            ["accelerate"],
+        )
 
 
 class FakeActionType:
