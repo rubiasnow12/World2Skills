@@ -62,9 +62,9 @@ def _episode(
         crashed=crashed,
         steps=len(step_records or []),
         mean_speed=20.0,
-        parse_failures=1,
-        unavailable_action_attempts=2,
-        llm_errors=3,
+        parse_failures=0,
+        unavailable_action_attempts=0,
+        llm_errors=0,
         terminated=False,
         truncated=False,
         max_steps_reached=False,
@@ -214,6 +214,7 @@ def test_aggregate_rejects_invalid_episode_status(status: str) -> None:
         ("truncated", "false"),
         ("max_steps_reached", None),
         ("scenario_completed", 1),
+        ("target_initially_ahead", "true"),
     ],
 )
 def test_aggregate_rejects_nonboolean_summary_flags(
@@ -255,6 +256,27 @@ def test_aggregate_rejects_successful_error_episode() -> None:
         _batch([episode])
 
 
+def test_aggregate_rejects_step_count_trace_mismatch() -> None:
+    episode = replace(
+        _episode(0, step_records=[_step()]),
+        steps=0,
+    )
+
+    with pytest.raises(ValueError, match="steps.*step_records"):
+        _batch([episode])
+
+
+def test_aggregate_rejects_fallback_counter_overflow() -> None:
+    episode = replace(
+        _episode(0, step_records=[_step()]),
+        parse_failures=1,
+        unavailable_action_attempts=1,
+    )
+
+    with pytest.raises(ValueError, match="fallback.*steps"):
+        _batch([episode])
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -274,6 +296,71 @@ def test_aggregate_rejects_invalid_summary_numbers(
     episode = replace(_episode(0), **{field: value})
 
     with pytest.raises(ValueError, match=rf"{field}.*finite"):
+        _batch([episode])
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("mean_speed", -0.01, "nonnegative"),
+        ("lead_initial_gap_m", 0.0, "positive"),
+        ("lead_initial_gap_m", -1.0, "positive"),
+    ],
+)
+def test_aggregate_rejects_out_of_range_summary_metrics(
+    field: str,
+    value: float,
+    error: str,
+) -> None:
+    episode = replace(_episode(0), **{field: value})
+
+    with pytest.raises(ValueError, match=rf"{field}.*{error}"):
+        _batch([episode])
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    [
+        ({"crashed": True}, "crashed"),
+        ({"scenario_completed": False}, "scenario_completed"),
+        ({"target_initially_ahead": False}, "target_initially_ahead"),
+        ({"lane_change_completed_step": None}, "causal steps"),
+        ({"overtake_step": None}, "causal steps"),
+        (
+            {
+                "lane_change_completed_step": 2,
+                "overtake_step": 2,
+            },
+            "lane_change.*overtake",
+        ),
+        (
+            {
+                "lane_change_completed_step": 3,
+                "overtake_step": 2,
+            },
+            "lane_change.*overtake",
+        ),
+        ({"success_reason": ""}, "success_reason"),
+        ({"success_reason": "   "}, "success_reason"),
+    ],
+)
+def test_aggregate_rejects_contradictory_success_contract(
+    changes: dict[str, object],
+    error: str,
+) -> None:
+    episode = replace(_episode(0, success=True), **changes)
+
+    with pytest.raises(ValueError, match=error):
+        _batch([episode])
+
+
+def test_aggregate_rejects_completed_unsuccessful_episode() -> None:
+    episode = replace(
+        _episode(0, success=False),
+        scenario_completed=True,
+    )
+
+    with pytest.raises(ValueError, match="scenario_completed.*success"):
         _batch([episode])
 
 

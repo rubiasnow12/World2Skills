@@ -24,6 +24,7 @@ _BOOLEAN_FIELDS = (
     "truncated",
     "max_steps_reached",
     "scenario_completed",
+    "target_initially_ahead",
 )
 _NONNEGATIVE_INTEGER_FIELDS = (
     "steps",
@@ -128,8 +129,69 @@ def _validate_episode_summary(result: EpisodeResult) -> None:
         if value is not None:
             _validate_finite_number(value, field_name)
 
+    if result.mean_speed < 0:
+        raise ValueError("mean_speed must be finite and nonnegative")
+    if (
+        result.lead_initial_gap_m is not None
+        and result.lead_initial_gap_m <= 0
+    ):
+        raise ValueError(
+            "lead_initial_gap_m must be finite and positive"
+        )
+
+    if result.steps != len(result.step_records):
+        raise ValueError("steps must equal len(step_records)")
+    fallback_count = (
+        result.parse_failures
+        + result.unavailable_action_attempts
+        + result.llm_errors
+    )
+    if fallback_count > result.steps:
+        raise ValueError(
+            "fallback counter sum must not exceed steps"
+        )
+
     if result.status == "error" and result.success:
         raise ValueError("error episode cannot report success")
+    if result.success:
+        _validate_success_contract(result)
+    elif result.scenario_completed:
+        raise ValueError(
+            "scenario_completed=True requires success=True"
+        )
+
+
+def _validate_success_contract(result: EpisodeResult) -> None:
+    if result.status != "ok":
+        raise ValueError("success=True requires status='ok'")
+    if result.crashed:
+        raise ValueError("success=True requires crashed=False")
+    if not result.scenario_completed:
+        raise ValueError(
+            "success=True requires scenario_completed=True"
+        )
+    if not result.target_initially_ahead:
+        raise ValueError(
+            "success=True requires target_initially_ahead=True"
+        )
+    if (
+        result.lane_change_completed_step is None
+        or result.overtake_step is None
+    ):
+        raise ValueError(
+            "success=True requires non-None causal steps"
+        )
+    if result.lane_change_completed_step >= result.overtake_step:
+        raise ValueError(
+            "lane_change_completed_step must precede overtake_step"
+        )
+    if (
+        not isinstance(result.success_reason, str)
+        or not result.success_reason.strip()
+    ):
+        raise ValueError(
+            "success=True requires a non-empty success_reason"
+        )
 
 
 def _validate_finite_number(value: object, field_name: str) -> None:
