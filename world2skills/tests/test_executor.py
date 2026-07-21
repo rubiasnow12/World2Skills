@@ -55,6 +55,27 @@ def _executor(
     )
 
 
+def _observation_context(
+    available_primitives: list[str],
+) -> ObservationContext:
+    return ObservationContext(
+        available_primitives=available_primitives,
+        ego_lane=1,
+        prev_primitive=None,
+        target_ahead=True,
+        target_gap_m=20.0,
+        target_rel_speed_mps=-5.0,
+        left_lane_exists=True,
+        right_lane_exists=True,
+        left_front_gap_m=30.0,
+        left_rear_gap_m=25.0,
+        left_rear_closing_speed_mps=0.0,
+        right_front_gap_m=30.0,
+        right_rear_gap_m=25.0,
+        right_rear_closing_speed_mps=0.0,
+    )
+
+
 def test_valid_json_primitive_maps_to_backend_index():
     result = _executor('{"primitive": "accelerate"}').decide(
         "observation",
@@ -199,6 +220,8 @@ def test_prompt_contains_full_skill_contract_and_filtered_allowed_list():
     assert "# Execution graph" in user
     assert '"id": "check-lead"' in user
     assert '"action": "decelerate"' in user
+    assert "# Effects" in user
+    assert "ego ahead of the previously blocking lead vehicle" in user
     assert "# Success criteria" in user
     assert "ego overtook the lead vehicle" in user
     assert "# Failure criteria" in user
@@ -218,21 +241,8 @@ def test_prompt_contains_full_skill_contract_and_filtered_allowed_list():
 
 
 def test_build_messages_accepts_approved_observation_context_interface():
-    context = ObservationContext(
-        available_primitives=["teleport", "decelerate", "accelerate"],
-        ego_lane=1,
-        prev_primitive=None,
-        target_ahead=True,
-        target_gap_m=20.0,
-        target_rel_speed_mps=-5.0,
-        left_lane_exists=True,
-        right_lane_exists=True,
-        left_front_gap_m=30.0,
-        left_rear_gap_m=25.0,
-        left_rear_closing_speed_mps=0.0,
-        right_front_gap_m=30.0,
-        right_rear_gap_m=25.0,
-        right_rear_closing_speed_mps=0.0,
+    context = _observation_context(
+        ["teleport", "decelerate", "accelerate"]
     )
 
     messages = _executor().build_messages("observation", context)
@@ -241,6 +251,45 @@ def test_build_messages_accepts_approved_observation_context_interface():
         '# Allowed primitives this step\n["accelerate", "decelerate"]'
         in messages[1].content
     )
+
+
+def test_decide_accepts_matching_filtered_context_and_explicit_availability():
+    context = _observation_context(
+        ["unknown", "decelerate", "accelerate", "decelerate"]
+    )
+
+    result = _executor('{"primitive": "accelerate"}').decide(
+        "observation",
+        context,
+        ["accelerate", "teleport", "decelerate"],
+    )
+
+    assert result.decision_status == "ok"
+    assert result.available_primitives == ["accelerate", "decelerate"]
+
+
+def test_decide_rejects_context_availability_mismatch_before_llm_call():
+    calls = 0
+
+    def reply(_messages):
+        nonlocal calls
+        calls += 1
+        return '{"primitive": "accelerate"}'
+
+    executor = _executor(client=MockLLMClient(reply))
+    context = _observation_context(["maintain-speed", "accelerate"])
+
+    with pytest.raises(
+        ValueError,
+        match="context available_primitives do not match explicit availability",
+    ):
+        executor.decide(
+            "observation",
+            context,
+            ["maintain-speed", "decelerate"],
+        )
+
+    assert calls == 0
 
 
 @pytest.mark.parametrize(

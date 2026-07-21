@@ -165,6 +165,8 @@ class LLMSkillExecutor:
                 + _list_block(card.preconditions),
                 "# Execution graph\n"
                 + _json_block(card.execution),
+                "# Effects\n"
+                + _list_block(card.effects),
                 "# Success criteria\n"
                 + _list_block(card.success_criteria),
                 "# Failure criteria\n"
@@ -215,13 +217,25 @@ class LLMSkillExecutor:
     def decide(
         self,
         obs_text: str,
-        context: Any,
+        context: ObservationContext | None,
         available_primitives: Sequence[str],
     ) -> DecisionResult:
         """Call the LLM, validate its choice, and return an executable action."""
 
-        del context
-        allowed = self._require_available(available_primitives)
+        allowed = self._filter_available(available_primitives)
+        if context is not None:
+            context_allowed = self._filter_available(
+                context.available_primitives
+            )
+            if context_allowed != allowed:
+                raise ValueError(
+                    "context available_primitives do not match explicit "
+                    "availability"
+                )
+        if not allowed:
+            raise NoAvailablePrimitiveError(
+                "no skill primitive is currently available"
+            )
         messages = self.build_messages(obs_text, allowed)
         status = "ok"
         fallback_reason: str | None = None
